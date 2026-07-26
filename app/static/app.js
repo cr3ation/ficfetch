@@ -13,6 +13,7 @@ const state = {
   openPanel: null, // "filters" | "guide" | null
   library: { categories: [], loaded: false },
   activeTab: "search",
+  dlCounts: { done: 0, skipped: 0, error: 0 }, // running tally for the download bar
 };
 
 const $ = (id) => document.getElementById(id);
@@ -77,17 +78,23 @@ es.addEventListener("progress", (e) => showProgress(JSON.parse(e.data)));
 es.addEventListener("item_done", (e) => {
   const d = JSON.parse(e.data);
   markRow(d.work_id, d.status, d.message);
+  if (d.status in state.dlCounts) {
+    state.dlCounts[d.status] += 1;
+    renderDlCounts(state.dlCounts.done, state.dlCounts.skipped, state.dlCounts.error);
+  }
 });
 
 es.addEventListener("job_done", (e) => {
   const d = JSON.parse(e.data);
-  const summary = $("progress-summary");
-  summary.textContent = `Finished — done: ${d.done} · skipped: ${d.skipped} · errors: ${d.errors}`;
-  summary.classList.remove("hidden");
   $("progress-text").textContent = "Job complete";
   $("progress-bar").style.width = "100%";
+  renderDlCounts(d.done, d.skipped, d.errors);
   $("download-btn").disabled = false;
   state.library.loaded = false; // stale now — refetch on next Library visit
+  // Leave the final tally up briefly, then retract the bar (the full detail
+  // stays in the activity log below).
+  clearTimeout(state.dlHideTimer);
+  state.dlHideTimer = setTimeout(hideDlBar, 6000);
 });
 
 es.onerror = () => {
@@ -502,10 +509,13 @@ $("download-btn").addEventListener("click", async () => {
       return;
     }
     selected.forEach((w) => markRow(w.work_id, "queued", ""));
-    $("progress-summary").classList.add("hidden");
-    $("progress-card").classList.remove("hidden");
-    $("progress-text").textContent = "Queued...";
+    clearTimeout(state.dlHideTimer);
+    state.dlCounts = { done: 0, skipped: 0, error: 0 };
+    renderDlCounts(0, 0, 0);
+    $("progress-text").textContent = "Queued…";
+    $("progress-fraction").textContent = `0 / ${selected.length}`;
     $("progress-bar").style.width = "0%";
+    showDlBar();
   } catch (err) {
     appendLog({ level: "error", message: `Enqueue request failed: ${err.message}` });
     $("download-btn").disabled = false;
@@ -513,12 +523,34 @@ $("download-btn").addEventListener("click", async () => {
 });
 
 function showProgress({ current, total, title }) {
-  $("progress-card").classList.remove("hidden");
-  $("progress-summary").classList.add("hidden");
+  showDlBar();
+  clearTimeout(state.dlHideTimer);
   $("progress-text").textContent = `Downloading: ${title}`;
   $("progress-fraction").textContent = `${current} / ${total}`;
   $("progress-bar").style.width = `${Math.round((current / total) * 100)}%`;
+  renderDlCounts(state.dlCounts.done, state.dlCounts.skipped, state.dlCounts.error);
 }
+
+// The sticky download bar shifts the page down while visible so it never
+// covers the header — mirrors the #connection-banner fixed idiom.
+function showDlBar() {
+  $("dl-bar").classList.remove("hidden");
+  document.body.style.paddingTop = "56px";
+}
+
+function hideDlBar() {
+  $("dl-bar").classList.add("hidden");
+  document.body.style.paddingTop = "";
+}
+
+function renderDlCounts(done, skipped, error) {
+  $("progress-counts").innerHTML =
+    `<span class="text-emerald-400">${done} done</span>` +
+    `<span class="text-slate-400">${skipped} skipped</span>` +
+    `<span class="text-red-400">${error} failed</span>`;
+}
+
+$("dl-bar-close").addEventListener("click", hideDlBar);
 
 // ---------------------------------------------------------------- Library
 
