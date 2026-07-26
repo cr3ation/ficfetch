@@ -6,6 +6,10 @@
 
 A self-hosted web app that searches [Archive of Our Own](https://archiveofourown.org) by author, tag/fandom, or work link, and downloads works as e-books (EPUB, PDF, MOBI, HTML, AZW3) via AO3's own download endpoints. A global rate limiter keeps it polite, and it's built to feed [Calibre](https://calibre-ebook.com/)'s auto-import.
 
+<p align="center">
+  <img src="docs/screenshot.png" alt="FicFetch search results — result rows with ratings, tags and stats, ready to download" width="900">
+</p>
+
 ## Quick start
 
 ```bash
