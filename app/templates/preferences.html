@@ -34,7 +34,7 @@
             <img src="/api/cover-preview/{{ s }}" alt="{{ s }} cover preview"
                  class="w-full aspect-[5/8] object-cover" loading="lazy">
             <div class="px-2 py-1.5 text-center text-xs capitalize text-slate-300">
-              {{ s }}{% if s == 'hybrid' %} · default{% endif %}
+              {{ s }}{% if s == 'hybrid' %} · default{% elif s in ['paper', 'framed'] %} · e-ink{% endif %}
             </div>
           </div>
         </label>
