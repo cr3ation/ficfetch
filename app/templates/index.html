@@ -255,6 +255,12 @@
             <input id="select-all" type="checkbox" class="rounded accent-indigo-500">
             Select all
           </label>
+          <div class="relative flex-1 min-w-[180px] max-w-xs">
+            <input id="results-filter" type="text" placeholder="Filter results by title, author, tag…" autocomplete="off"
+                   class="w-full bg-slate-800 border border-slate-700 rounded-lg pl-3 pr-8 py-1.5 text-sm placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500">
+            <button id="results-filter-clear" type="button" aria-label="Clear filter"
+                    class="hidden absolute right-1 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300 text-lg leading-none px-1.5">&times;</button>
+          </div>
           <span id="results-count" class="text-sm text-slate-400"></span>
           <span id="results-message" class="text-sm text-amber-400"></span>
           <button id="download-btn"
