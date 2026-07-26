@@ -21,6 +21,7 @@ from __future__ import annotations
 import colorsys
 import hashlib
 import io
+import math
 import random
 from pathlib import Path
 
@@ -33,9 +34,12 @@ _SERIF = str(FONT_DIR / "EBGaramond-VF.ttf")
 _SANS = str(FONT_DIR / "Inter-VF.ttf")
 
 # 'none' is handled by callers (skip generation); these are the drawable styles.
-ALLOWED_STYLES: tuple[str, ...] = ("hybrid", "art", "editorial", "bold")
+# 'paper'/'framed' are light, high-contrast styles for black-and-white e-readers.
+ALLOWED_STYLES: tuple[str, ...] = ("hybrid", "art", "editorial", "bold", "paper", "framed")
 DEFAULT_STYLE = "hybrid"
-STYLE_CHOICES: tuple[str, ...] = ("hybrid", "art", "editorial", "bold", "none")
+STYLE_CHOICES: tuple[str, ...] = ("hybrid", "art", "editorial", "bold", "paper", "framed", "none")
+# Light styles skip the film grain — it speckles a light background and muddies e-ink.
+_LIGHT_STYLES = frozenset({"paper", "framed"})
 
 # Classic e-book cover ratio (5:8).
 W, H = 1600, 2560
@@ -104,6 +108,12 @@ def _palette(title: str) -> dict:
         "line": _hsl(h, 0.35, 0.38),
         "text": _hsl(h, 0.16, 0.95),
         "muted": _hsl(h, 0.28, 0.72),
+        # Light, e-ink-friendly scheme: near-white paper, near-black ink, a
+        # saturated medium-dark accent that keeps contrast even in grayscale.
+        "paper": _hsl(h, 0.10, 0.965),
+        "ink": _hsl(h, 0.28, 0.11),
+        "accent_dark": _hsl(h, 0.62, 0.40),
+        "muted_ink": _hsl(h, 0.10, 0.45),
     }
 
 
@@ -303,11 +313,113 @@ def _render_hybrid(work: Work, pal: dict) -> Image.Image:
     return img
 
 
+# ---------------------------------------------------------------- light styles
+
+# Seeded ornament corners for the 'framed' style. (x, y) is a frame corner and
+# (qx, qy) the inward direction; everything is drawn as thin accent lines so it
+# stays crisp — a thin grey line — on a black-and-white e-reader.
+_QANG = {(1, 1): 0, (-1, 1): 90, (-1, -1): 180, (1, -1): 270}
+
+
+def _c_arcs(d, x, y, qx, qy, col, w):
+    a = _QANG[(qx, qy)]
+    for rr in (150, 102, 63):
+        d.arc([x - rr, y - rr, x + rr, y + rr], a, a + 90, fill=col, width=w)
+    d.ellipse([x - 7, y - 7, x + 7, y + 7], fill=col)
+
+
+def _c_bracket(d, x, y, qx, qy, col, w):
+    for g, ln in ((28, 150), (50, 118)):
+        d.line([(x + qx * g, y + qy * g), (x + qx * g + qx * ln, y + qy * g)], fill=col, width=w)
+        d.line([(x + qx * g, y + qy * g), (x + qx * g, y + qy * g + qy * ln)], fill=col, width=w)
+    d.ellipse([x - 6, y - 6, x + 6, y + 6], fill=col)
+
+
+def _c_steps(d, x, y, qx, qy, col, w):
+    for i in range(3):
+        o, ln = 24 + i * 26, 150 - i * 36
+        d.line([(x + qx * o, y + qy * o), (x + qx * o + qx * ln, y + qy * o)], fill=col, width=w)
+        d.line([(x + qx * o, y + qy * o), (x + qx * o, y + qy * o + qy * ln)], fill=col, width=w)
+
+
+def _c_rays(d, x, y, qx, qy, col, w):
+    px, py = x + qx * 18, y + qy * 18
+    base = _QANG[(qx, qy)]
+    for a in range(0, 91, 15):
+        ang = math.radians(base + a)
+        d.line([(px, py), (px + math.cos(ang) * 130, py + math.sin(ang) * 130)], fill=col, width=w)
+    d.ellipse([px - 6, py - 6, px + 6, py + 6], fill=col)
+
+
+_CORNERS = (_c_arcs, _c_bracket, _c_steps, _c_rays)
+
+
+def _top_orn(d, cx, ty, kind, col, w):
+    if kind == 0:
+        d.polygon([(cx, ty - 22), (cx + 22, ty), (cx, ty + 22), (cx - 22, ty)], outline=col, width=w)
+    elif kind == 1:
+        for dx in (-46, 0, 46):
+            d.ellipse([cx + dx - 6, ty - 6, cx + dx + 6, ty + 6], fill=col)
+    elif kind == 2:
+        d.ellipse([cx - 20, ty - 20, cx + 20, ty + 20], outline=col, width=w)
+        d.ellipse([cx - 5, ty - 5, cx + 5, ty + 5], fill=col)
+    else:
+        for a in range(0, 360, 45):
+            ang = math.radians(a)
+            d.line([(cx, ty), (cx + math.cos(ang) * 24, ty + math.sin(ang) * 24)], fill=col, width=w)
+
+
+def _paper_base(work: Work, pal: dict, ornate: bool) -> Image.Image:
+    """Light, high-contrast cover: near-black serif on near-white paper. `ornate`
+    adds a seeded decorative frame; otherwise a plain thin double rule."""
+    img = Image.new("RGB", (W, H), pal["paper"])
+    d = ImageDraw.Draw(img)
+    acc, ink, mut = pal["accent_dark"], pal["ink"], pal["muted_ink"]
+    cx = W // 2
+    if ornate:
+        rng = random.Random(_seed(work.title))
+        corner = rng.choice(_CORNERS)
+        topk = rng.randrange(4)
+        double = rng.random() < 0.7
+        m, m2 = 96, 116
+        d.rectangle([m, m, W - m, H - m], outline=acc, width=4)
+        if double:
+            d.rectangle([m2, m2, W - m2, H - m2], outline=acc, width=1)
+        ci = m2 if double else m
+        for qx, qy, ox, oy in ((1, 1, ci, ci), (-1, 1, W - ci, ci),
+                               (1, -1, ci, H - ci), (-1, -1, W - ci, H - ci)):
+            corner(d, ox, oy, qx, qy, acc, 3)
+        _top_orn(d, cx, 300, topk, acc, 3)
+    else:
+        d.rectangle([90, 90, W - 90, H - 90], outline=acc, width=4)
+        d.rectangle([112, 112, W - 112, H - 112], outline=acc, width=1)
+    if _fandom_line(work):
+        _tracked(d, cx, 384, _fandom_line(work), _sans(46, "SemiBold"), acc, 10)
+    d.line([cx - 120, 500, cx + 120, 500], fill=acc, width=4)
+    fnt, lines, lh = _fit_title(d, work.title, lambda s: _serif(s, "SemiBold"), W - 380, 720, 210, 112, 3)
+    _draw_lines(d, cx, int(H * 0.44), lines, fnt, lh, ink)
+    d.line([cx - 120, int(H * 0.66), cx + 120, int(H * 0.66)], fill=acc, width=4)
+    _tracked(d, cx, int(H * 0.715), _author(work), _sans(62, "SemiBold"), ink, 8)
+    if _meta_line(work):
+        _tracked(d, cx, H - 200, _meta_line(work), _sans(34), mut, 6)
+    return img
+
+
+def _render_paper(work: Work, pal: dict) -> Image.Image:
+    return _paper_base(work, pal, ornate=False)
+
+
+def _render_framed(work: Work, pal: dict) -> Image.Image:
+    return _paper_base(work, pal, ornate=True)
+
+
 _RENDERERS = {
     "hybrid": _render_hybrid,
     "art": _render_art,
     "editorial": _render_editorial,
     "bold": _render_bold,
+    "paper": _render_paper,
+    "framed": _render_framed,
 }
 
 
@@ -318,7 +430,9 @@ def generate_cover(work: Work, style: str = DEFAULT_STYLE) -> bytes:
     renderer = _RENDERERS.get(style)
     if renderer is None:
         raise ValueError(f"Unknown cover style: {style!r}")
-    img = _grain(renderer(work, _palette(work.title)))
+    img = renderer(work, _palette(work.title))
+    if style not in _LIGHT_STYLES:
+        img = _grain(img)  # film grain only for the textured dark styles
     out = io.BytesIO()
     img.save(out, format="JPEG", quality=88, optimize=True)
     return out.getvalue()
