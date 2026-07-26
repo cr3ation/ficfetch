@@ -7,6 +7,7 @@ const state = {
   statuses: new Map(), // work_id -> {status, message} (survives re-sorts)
   downloaded: new Map(), // work_id -> formats already in the library
   sort: { key: null, dir: "desc" }, // local results sort
+  resultsFilter: "", // free-text filter over the current search results
   searchType: "author",
   lastQuery: "",
   category: "", // download folder name; differs from lastQuery for pasted links
@@ -277,8 +278,11 @@ function renderResults({ works, message, truncated, downloaded }) {
   state.statuses = new Map();
   state.sort = { key: null, dir: "desc" };
 
-  $("results-count").textContent =
+  state.resultsLabel =
     works.length === 0 ? "No works found." : `${works.length} works found${truncated ? " (limit reached)" : ""}`;
+  state.resultsFilter = "";
+  $("results-filter").value = "";
+  $("results-filter-clear").classList.add("hidden");
   $("results-message").textContent = message || "";
   $("results-card").classList.remove("hidden");
   $("select-all").checked = false;
@@ -318,7 +322,24 @@ function renderResultRows() {
     arrow.textContent = th.dataset.sortKey === state.sort.key ? (state.sort.dir === "asc" ? "↑" : "↓") : "";
   });
 
-  for (const id of sortedWorkIds()) {
+  const needle = state.resultsFilter.trim().toLowerCase();
+  const ids = sortedWorkIds().filter((id) => matchesResultFilter(state.results.get(id), needle));
+
+  $("results-count").textContent = needle
+    ? `${ids.length} of ${state.order.length} shown`
+    : state.resultsLabel || "";
+
+  if (needle && ids.length === 0) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = 6;
+    td.className = "px-5 py-8 text-center text-sm text-slate-500";
+    td.textContent = "No results match your filter.";
+    tr.appendChild(td);
+    body.appendChild(tr);
+  }
+
+  for (const id of ids) {
     const w = state.results.get(id);
     const tr = document.createElement("tr");
     tr.dataset.workId = w.work_id;
@@ -399,7 +420,22 @@ function renderResultRows() {
       );
     }
   }
+  syncSelectAll(ids);
   updateSelectedCount();
+}
+
+function matchesResultFilter(w, needle) {
+  if (!needle) return true;
+  const hay = [w.title, ...(w.authors || []), ...(w.tags || []), ...(w.fandoms || [])]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+  // Every space-separated term must appear somewhere (AND across fields).
+  return needle.split(/\s+/).filter(Boolean).every((term) => hay.includes(term));
+}
+
+function syncSelectAll(visibleIds) {
+  $("select-all").checked = visibleIds.length > 0 && visibleIds.every((id) => state.selected.has(id));
 }
 
 function numberCell(value) {
@@ -444,10 +480,28 @@ document.querySelectorAll("th.sortable").forEach((th) => {
 });
 
 $("select-all").addEventListener("change", (e) => {
-  if (e.target.checked) state.selected = new Set(state.order);
-  else state.selected = new Set();
+  // Operate on the currently-visible (filtered) rows; selections outside the
+  // filter are preserved so you can filter and select in passes.
+  const needle = state.resultsFilter.trim().toLowerCase();
+  const visible = state.order.filter((id) => matchesResultFilter(state.results.get(id), needle));
+  if (e.target.checked) visible.forEach((id) => state.selected.add(id));
+  else visible.forEach((id) => state.selected.delete(id));
   document.querySelectorAll(".row-check").forEach((cb) => (cb.checked = e.target.checked));
   updateSelectedCount();
+});
+
+$("results-filter").addEventListener("input", () => {
+  state.resultsFilter = $("results-filter").value;
+  $("results-filter-clear").classList.toggle("hidden", !state.resultsFilter.trim());
+  renderResultRows();
+});
+
+$("results-filter-clear").addEventListener("click", () => {
+  state.resultsFilter = "";
+  $("results-filter").value = "";
+  $("results-filter-clear").classList.add("hidden");
+  renderResultRows();
+  $("results-filter").focus();
 });
 
 function updateSelectedCount() {
