@@ -50,6 +50,22 @@ Two defaults make this work, both on:
 
 `metadata.json` lives in `./config/`, never the watch folder, so Calibre only ever sees e-books there. The app remembers imported works via that file and won't re-download what Calibre already took — use **Forget** in the Library to override. The embedded tag is EPUB-only, so keep EPUB as the format for this workflow.
 
+## Grimmory / BookLore integration
+
+Point `DOWNLOADS_PATH` at [Grimmory](https://grimmory.org)'s **Bookdrop** folder and works flow in the same way. One thing needs a nudge, though: EPUB has no separate tag field, so AO3's export puts *everything* — rating, category, archive warnings, fandoms, relationships, characters and every freeform tag — into one flat `<dc:subject>` list. Grimmory reads that list as **Genres**, so a stock AO3 file arrives with fifty genres and nothing under Tags.
+
+Turn on **System → Library → I use Grimmory (or BookLore)** and FicFetch embeds Grimmory's own `booklore:` metadata alongside AO3's, so the two land where they belong:
+
+| | |
+|---|---|
+| **Genres** | `Fanfiction`, AO3's `Fanworks`, and the work's fandoms |
+| **Tags** | rating, category, warnings, relationships, characters, freeform tags |
+| **Content / age rating** | mapped from the AO3 rating — Explicit → `EXPLICIT` / 18, Mature → `MATURE` / 16, Teen And Up → `TEEN` / 13, General Audiences → `EVERYONE` / 0 |
+
+The change is **additive**: `dc:subject` is left exactly as AO3 wrote it, and Grimmory removes the moved entries from Genres by itself. So the Calibre workflow above keeps importing every AO3 tag, unchanged. Both other options — how much stays a genre, and whether the moved entries are stripped from `dc:subject` too — sit on the same page, and everything takes effect on the next download without a restart.
+
+One caveat: Grimmory splits tag lists on every comma, so a tag like `Sorry, Not Sorry` is written without it. Those few tags also linger as genres unless you enable **Remove the moved tags from the file's subject list**.
+
 ## Accounts & authentication
 
 Every page and endpoint is behind a login. Two roles: **admin** (full access, including the **System** area) and **user** (search, download, library — no System). Manage accounts under **System → Accounts**; the last admin can't be deleted or demoted.
