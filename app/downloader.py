@@ -16,14 +16,16 @@ from . import scraper
 from .ao3_client import AO3Client, AO3Error, RestrictedWorkError
 from .config import Settings
 from .events import EventBus
-from .models import ItemStatus, Job, JobItem, Work
+from .grimmory import booklore_metas, load_grimmory_config, split_subjects
+from .models import GrimmoryConfig, ItemStatus, Job, JobItem, Work
 from .covers import generate_cover
 from .utils import (
     add_epub_cover,
-    add_epub_subject,
+    add_epub_metadata,
     atomic_write_bytes,
     atomic_write_text,
     epub_has_cover,
+    epub_subjects,
     sanitize_filename,
 )
 
@@ -140,6 +142,9 @@ class DownloadManager:
         folder.mkdir(parents=True, exist_ok=True)
         meta_folder.mkdir(parents=True, exist_ok=True)
         total = len(job.items)
+        # Read once per job rather than at startup, so the System → Library
+        # integration toggle applies to the next download, not the next restart.
+        grimmory = load_grimmory_config(self._settings.db_path)
 
         for i, item in enumerate(job.items, start=1):
             work = item.work
@@ -188,9 +193,9 @@ class DownloadManager:
                 self._publish_item(job, item)
                 continue
 
-            if job.format == "epub" and self._settings.epub_tag:
+            if job.format == "epub" and (self._settings.epub_tag or grimmory.enabled):
                 try:
-                    data = add_epub_subject(data, self._settings.epub_tag)
+                    data = self._embed_metadata(data, work, grimmory)
                 except Exception as exc:
                     self._bus.log("warning", f"Could not embed tag in EPUB for {work.title}: {exc}")
 
@@ -226,6 +231,29 @@ class DownloadManager:
             "info",
             f"Job {job.job_id} finished — done: {counts['done']}, "
             f"skipped: {counts['skipped']}, errors: {counts['error']}.",
+        )
+
+    def _embed_metadata(self, data: bytes, work: Work, grimmory: GrimmoryConfig) -> bytes:
+        """Write the configured tag, and — in Grimmory mode — the genre/tag split.
+
+        The split is computed over the subjects AO3 shipped plus the one we are
+        about to add, so the tag itself is always classified as a genre.
+        """
+        subjects = [self._settings.epub_tag] if self._settings.epub_tag else []
+        if not grimmory.enabled:
+            return add_epub_metadata(data, subjects=subjects)
+
+        _, tags = split_subjects(
+            epub_subjects(data) + subjects,
+            work,
+            epub_tag=self._settings.epub_tag,
+            genre_mode=grimmory.genres,
+        )
+        return add_epub_metadata(
+            data,
+            subjects=subjects,
+            metas=booklore_metas(work, tags, map_rating=grimmory.map_rating),
+            drop_subjects=set(tags) if grimmory.trim_subjects else frozenset(),
         )
 
     def _publish_item(self, job: Job, item: JobItem) -> None:

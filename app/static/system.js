@@ -28,3 +28,17 @@ document.querySelectorAll("form[data-confirm]").forEach((form) => {
 document.querySelectorAll("select[data-autosubmit]").forEach((select) => {
   select.addEventListener("change", () => select.form.submit());
 });
+
+// Sub-options that only apply while their master checkbox is ticked. Disabling
+// rather than hiding is deliberate: a disabled field submits nothing, which is
+// what lets the server leave the stored values alone.
+document.querySelectorAll("[data-enabled-by]").forEach((group) => {
+  const master = document.getElementById(group.dataset.enabledBy);
+  if (!master) return;
+  const sync = () => {
+    group.disabled = !master.checked;
+    group.classList.toggle("opacity-40", !master.checked);
+  };
+  master.addEventListener("change", sync);
+  sync();
+});

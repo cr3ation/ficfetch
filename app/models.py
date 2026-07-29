@@ -113,6 +113,16 @@ class OidcConfig:
         return self.enabled and bool(self.client_id) and bool(self.issuer)
 
 
+@dataclass(frozen=True)
+class GrimmoryConfig:
+    """How much Grimmory-specific metadata to embed in downloaded EPUBs."""
+
+    enabled: bool
+    genres: str  # 'tag_only' | 'fandoms' | 'extended'
+    trim_subjects: bool
+    map_rating: bool
+
+
 @dataclass
 class JobItem:
     work: Work

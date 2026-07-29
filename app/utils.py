@@ -6,7 +6,8 @@ import re
 import urllib.parse
 import zipfile
 from pathlib import Path
-from xml.sax.saxutils import escape
+from typing import Container, Sequence
+from xml.sax.saxutils import escape, quoteattr, unescape
 
 _UNSAFE_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 
@@ -85,36 +86,6 @@ def atomic_write_text(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
-def add_epub_subject(data: bytes, subject: str) -> bytes:
-    """Append a <dc:subject> to the EPUB's OPF metadata.
-
-    Calibre (with its default "read metadata from file contents" setting) turns
-    dc:subject entries into tags on import — this is what actually tags the book,
-    since calibre's filename regex cannot set tags.
-    """
-    src = zipfile.ZipFile(io.BytesIO(data))
-    container = src.read("META-INF/container.xml").decode("utf-8")
-    match = re.search(r'full-path="([^"]+)"', container)
-    if not match:
-        raise ValueError("No OPF path in META-INF/container.xml")
-    opf_name = match.group(1)
-    opf = src.read(opf_name).decode("utf-8")
-
-    element = f"<dc:subject>{escape(subject)}</dc:subject>"
-    if "xmlns:dc" not in opf or "</metadata>" not in opf:
-        raise ValueError("OPF lacks a dc-namespaced metadata block")
-    if element not in opf:
-        opf = opf.replace("</metadata>", f"  {element}\n</metadata>", 1)
-
-    out = io.BytesIO()
-    with zipfile.ZipFile(out, "w") as dst:
-        # infolist preserves order, keeping the uncompressed mimetype entry first.
-        for item in src.infolist():
-            content = opf.encode("utf-8") if item.filename == opf_name else src.read(item.filename)
-            dst.writestr(item, content)
-    return out.getvalue()
-
-
 def _read_opf(data: bytes) -> tuple[str, str]:
     """Return (opf_path_in_zip, opf_text). Raises if the archive isn't a sane EPUB."""
     src = zipfile.ZipFile(io.BytesIO(data))
@@ -124,6 +95,91 @@ def _read_opf(data: bytes) -> tuple[str, str]:
         raise ValueError("No OPF path in META-INF/container.xml")
     opf_name = match.group(1)
     return opf_name, src.read(opf_name).decode("utf-8")
+
+
+def _rewrite_opf(data: bytes, opf_name: str, opf: str, extra: dict | None = None) -> bytes:
+    """Copy the archive back out with `opf` swapped in, plus any `extra` files.
+
+    infolist preserves entry order, which keeps the uncompressed mimetype first —
+    a requirement of the EPUB container spec.
+    """
+    src = zipfile.ZipFile(io.BytesIO(data))
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w") as dst:
+        for item in src.infolist():
+            content = opf.encode("utf-8") if item.filename == opf_name else src.read(item.filename)
+            dst.writestr(item, content)
+        for name, (payload, compress) in (extra or {}).items():
+            info = zipfile.ZipInfo(name)
+            info.compress_type = compress
+            dst.writestr(info, payload)
+    return out.getvalue()
+
+
+# Namespace prefixes vary between producers, so match any (or none) on <subject>.
+_SUBJECT_RE = re.compile(
+    r"<(?:[A-Za-z0-9_.-]+:)?subject\b[^>]*>(.*?)</(?:[A-Za-z0-9_.-]+:)?subject\s*>",
+    re.DOTALL,
+)
+# unescape() only knows &amp;/&lt;/&gt; on its own; without these a quoted tag
+# would come back still entity-encoded and be double-escaped on the way out.
+_ENTITIES = {"&quot;": '"', "&apos;": "'"}
+
+
+def _subject_text(match: re.Match) -> str:
+    return unescape(match.group(1), _ENTITIES).strip()
+
+
+def epub_subjects(data: bytes) -> list[str]:
+    """Every <dc:subject> value in the OPF, in document order.
+
+    Unescaping matters: AO3 relationship tags routinely contain "&", which sits
+    in the file as &amp; and would otherwise never match anything we compare it to.
+    """
+    _, opf = _read_opf(data)
+    return [text for m in _SUBJECT_RE.finditer(opf) if (text := _subject_text(m))]
+
+
+def add_epub_metadata(
+    data: bytes,
+    *,
+    subjects: Sequence[str] = (),
+    metas: Sequence[tuple[str, str]] = (),
+    drop_subjects: Container[str] = frozenset(),
+) -> bytes:
+    """Add <dc:subject> and <meta> entries to the EPUB's OPF metadata block.
+
+    Calibre (with its default "read metadata from file contents" setting) turns
+    dc:subject entries into tags on import — this is what actually tags the book,
+    since calibre's filename regex cannot set tags.
+
+    `metas` are (name, value) pairs written in whichever form the package
+    version calls for: EPUB2's name/content attributes, or EPUB3's property
+    element. `drop_subjects` removes existing subjects by exact text — targeted,
+    never a blanket wipe.
+    """
+    opf_name, opf = _read_opf(data)
+    if "xmlns:dc" not in opf or "</metadata>" not in opf:
+        raise ValueError("OPF lacks a dc-namespaced metadata block")
+
+    if drop_subjects:
+        opf = _SUBJECT_RE.sub(
+            lambda m: "" if _subject_text(m) in drop_subjects else m.group(0), opf
+        )
+
+    epub3 = bool(re.search(r"<package\b[^>]*\bversion=[\"']3", opf))
+    additions = [f"<dc:subject>{escape(s)}</dc:subject>" for s in subjects]
+    additions += [
+        f"<meta property={quoteattr(name)}>{escape(value)}</meta>"
+        if epub3
+        else f"<meta name={quoteattr(name)} content={quoteattr(value)}/>"
+        for name, value in metas
+    ]
+    for element in additions:
+        if element not in opf:
+            opf = opf.replace("</metadata>", f"  {element}\n</metadata>", 1)
+
+    return _rewrite_opf(data, opf_name, opf)
 
 
 def epub_has_cover(data: bytes) -> bool:
@@ -160,7 +216,7 @@ _COVER_XHTML = (
 def add_epub_cover(data: bytes, jpeg: bytes) -> bytes:
     """Embed `jpeg` as the EPUB's cover (image + EPUB2/3 pointers + a cover page).
 
-    Mirrors add_epub_subject's raw-string OPF edit + full-archive rewrite. The
+    Mirrors add_epub_metadata's raw-string OPF edit + full-archive rewrite. The
     cover files are placed in the OPF's own directory and referenced relatively,
     so it works whether the OPF sits at the root (AO3) or in a subfolder.
     """
@@ -195,17 +251,7 @@ def add_epub_cover(data: bytes, jpeg: bytes) -> bytes:
             r"(<spine\b[^>]*>)", r'\1\n    <itemref idref="ficfetch-cover-page"/>', opf, count=1
         )
 
-    src = zipfile.ZipFile(io.BytesIO(data))
-    out = io.BytesIO()
-    with zipfile.ZipFile(out, "w") as dst:
-        for item in src.infolist():
-            content = opf.encode("utf-8") if item.filename == opf_name else src.read(item.filename)
-            dst.writestr(item, content)
-        img_info = zipfile.ZipInfo(img_name)
-        img_info.compress_type = zipfile.ZIP_STORED  # JPEG is already compressed
-        dst.writestr(img_info, jpeg)
-        if add_page:
-            page_info = zipfile.ZipInfo(page_name)
-            page_info.compress_type = zipfile.ZIP_DEFLATED
-            dst.writestr(page_info, _COVER_XHTML.encode("utf-8"))
-    return out.getvalue()
+    extra = {img_name: (jpeg, zipfile.ZIP_STORED)}  # JPEG is already compressed
+    if add_page:
+        extra[page_name] = (_COVER_XHTML.encode("utf-8"), zipfile.ZIP_DEFLATED)
+    return _rewrite_opf(data, opf_name, opf, extra)

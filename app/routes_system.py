@@ -12,7 +12,7 @@ from fastapi.responses import RedirectResponse, Response
 import ipaddress
 from urllib.parse import urlparse
 
-from . import auth, db, oidc
+from . import auth, db, grimmory, oidc
 from .config import Settings
 
 router = APIRouter(prefix="/system")
@@ -23,6 +23,7 @@ MESSAGES = {
     "role_set": "Role updated.",
     "deleted": "Account deleted.",
     "settings_saved": "Settings saved.",
+    "library_saved": "Library integration saved. It applies to the next download.",
 }
 ERRORS = {
     "csrf": "That form expired. Please try again.",
@@ -33,6 +34,7 @@ ERRORS = {
     "bad_password": "Password must be at least 8 characters and at most 72 bytes.",
     "bad_role": "Unknown role.",
     "oidc_incomplete": "Enabling SSO needs both a client ID and an issuer URL.",
+    "bad_genres": "Unknown genre option.",
 }
 
 
@@ -244,3 +246,54 @@ async def save_settings(
     db.set_settings(settings.db_path, values, datetime.now(timezone.utc).isoformat())
     oidc.invalidate_discovery_cache()
     return _back("settings", ok="settings_saved")
+
+
+@router.get("/library")
+async def library_page(request: Request) -> Response:
+    settings: Settings = request.app.state.settings
+    return render(
+        request,
+        "system_library.html",
+        "library",
+        {
+            "cfg": grimmory.load_grimmory_config(settings.db_path),
+            "epub_tag": settings.epub_tag,
+        },
+    )
+
+
+@router.post("/library")
+async def save_library(
+    request: Request,
+    csrf_token: str = Form(""),
+    enabled: str = Form(""),
+    genres: str = Form(grimmory.DEFAULT_GENRE_MODE),
+    trim_subjects: str = Form(""),
+    map_rating: str = Form(""),
+) -> Response:
+    settings: Settings = request.app.state.settings
+    if not _guard_csrf(request, csrf_token):
+        return _back("library", err="csrf")
+
+    now = datetime.now(timezone.utc).isoformat()
+    # Turning the integration off keeps the sub-options as they were, so they
+    # come back intact when it is turned on again — the form disables them, and
+    # a disabled field submits nothing.
+    if enabled != "true":
+        db.set_settings(settings.db_path, {"grimmory.enabled": "false"}, now)
+        return _back("library", ok="library_saved")
+
+    if genres not in grimmory.GENRE_MODES:
+        return _back("library", err="bad_genres")
+
+    db.set_settings(
+        settings.db_path,
+        {
+            "grimmory.enabled": "true",
+            "grimmory.genres": genres,
+            "grimmory.trim_subjects": "true" if trim_subjects == "true" else "false",
+            "grimmory.map_rating": "true" if map_rating == "true" else "false",
+        },
+        now,
+    )
+    return _back("library", ok="library_saved")

@@ -1,0 +1,76 @@
+{% extends "system_base.html" %}
+{% block title %}Library integration · FicFetch{% endblock %}
+
+{% block system_body %}
+<form method="post" action="/system/library" class="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-5">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <div>
+    <h2 class="text-sm font-medium text-slate-300">Grimmory / BookLore</h2>
+    <p class="text-xs text-slate-500 mt-1">
+      AO3's own EPUB export puts everything — rating, category, warnings, fandoms, relationships,
+      characters and every freeform tag — into one flat subject list, because EPUB has no separate
+      tag field. Grimmory reads that list as <span class="text-slate-400">Genres</span>, so an
+      untouched file lands with fifty genres and no tags.
+    </p>
+  </div>
+
+  <label class="flex items-start gap-3">
+    <input type="checkbox" name="enabled" value="true" id="grimmory-enabled"
+           {% if cfg.enabled %}checked{% endif %} class="mt-1 rounded accent-indigo-500">
+    <span class="text-sm">
+      <span class="text-slate-200">I use Grimmory (or BookLore)</span>
+      <span class="block text-slate-500 text-xs">Embeds Grimmory's own metadata fields so AO3's tags land under <span class="text-slate-400">Tags</span> instead of <span class="text-slate-400">Genres</span>. Nothing is removed from the file. Applies to the next EPUB download — no restart.</span>
+    </span>
+  </label>
+
+  <fieldset data-enabled-by="grimmory-enabled" class="space-y-5 border-t border-slate-800 pt-5">
+    <div class="text-sm">
+      <span class="block text-slate-400 mb-2">Keep as genres</span>
+      <div class="space-y-2">
+        {% set modes = [
+          ('fandoms',  'The tag plus the fandoms', 'Genres become “' ~ (epub_tag or 'the EPUB tag') ~ '”, AO3’s “Fanworks”, and the work’s fandoms. Everything else becomes a tag.'),
+          ('tag_only', 'Only the tag',             'A single genre. The fandoms end up among the tags with everything else.'),
+          ('extended', 'Also rating, category and warnings', 'Keeps Explicit, F/M, Graphic Depictions Of Violence and the like as genres too. More to filter on, a busier genre list.'),
+        ] %}
+        {% for value, label, hint in modes %}
+        <label class="flex items-start gap-3">
+          <input type="radio" name="genres" value="{{ value }}" {% if cfg.genres == value %}checked{% endif %}
+                 class="mt-1 accent-indigo-500">
+          <span>
+            <span class="text-slate-200">{{ label }}</span>
+            <span class="block text-slate-500 text-xs">{{ hint }}</span>
+          </span>
+        </label>
+        {% endfor %}
+      </div>
+    </div>
+
+    <label class="flex items-start gap-3">
+      <input type="checkbox" name="map_rating" value="true" {% if cfg.map_rating %}checked{% endif %}
+             class="mt-1 rounded accent-indigo-500">
+      <span class="text-sm">
+        <span class="text-slate-200">Map the AO3 rating to content and age rating</span>
+        <span class="block text-slate-500 text-xs">Explicit &rarr; EXPLICIT / 18, Mature &rarr; MATURE / 16, Teen And Up &rarr; TEEN / 13, General Audiences &rarr; EVERYONE / 0. Not Rated is left alone.</span>
+      </span>
+    </label>
+
+    <label class="flex items-start gap-3">
+      <input type="checkbox" name="trim_subjects" value="true" {% if cfg.trim_subjects %}checked{% endif %}
+             class="mt-1 rounded accent-indigo-500">
+      <span class="text-sm">
+        <span class="text-slate-200">Remove the moved tags from the file's subject list</span>
+        <span class="block text-slate-500 text-xs">Off by default — leaving them in place keeps the Calibre import exactly as it is today, and Grimmory drops them from Genres by itself. Turn it on for the cleanest possible file, at the cost of every other reader losing the AO3 tags.</span>
+      </span>
+    </label>
+  </fieldset>
+
+  <p class="text-xs text-slate-500 border-t border-slate-800 pt-4">
+    A tag containing a comma — “Sorry, Not Sorry” — is written without it, because Grimmory splits
+    tag lists on every comma. Those few tags also stay behind as genres unless the option above is on.
+  </p>
+
+  <div class="flex justify-end">
+    <button type="submit" class="bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium rounded-lg px-6 py-2.5">Save settings</button>
+  </div>
+</form>
+{% endblock %}
