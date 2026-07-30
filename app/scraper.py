@@ -268,7 +268,9 @@ async def search(
             break
 
         works.extend(page_works)
-        bus.log("info", f"Page {page}: found {len(page_works)} works ({min(len(works), max_results)} total).")
+        found = min(len(works), max_results)
+        bus.log("info", f"Page {page}: found {len(page_works)} works ({found} total).")
+        bus.publish("search_progress", {"current": found, "total": max_results})
 
         if not has_next_page(resp.text):
             break
