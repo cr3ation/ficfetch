@@ -21,22 +21,41 @@
     Reconnecting to server...
   </div>
 
-  <!-- Sticky download progress bar — shown while a job runs, always visible regardless of scroll. -->
-  <div id="dl-bar" class="hidden fixed top-0 inset-x-0 z-40 bg-slate-900/95 backdrop-blur border-b border-indigo-500/40 shadow-lg shadow-black/40">
-    <div class="max-w-5xl mx-auto px-4 py-2.5 flex items-center gap-4">
-      <svg class="h-5 w-5 text-indigo-400 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M12 3v12"/><path d="M8 11l4 4 4-4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/>
-      </svg>
-      <div class="min-w-0 flex-1">
-        <div id="progress-text" class="text-sm text-slate-200 truncate">Queued…</div>
-        <div class="mt-1.5 h-1.5 bg-slate-800 rounded-full overflow-hidden">
-          <div id="progress-bar" class="h-full bg-indigo-500 rounded-full transition-all duration-300" style="width: 0%"></div>
+  <!-- Sticky progress bars — search and download stack here, always visible regardless of scroll. -->
+  <div id="sticky-bars" class="fixed top-0 inset-x-0 z-40">
+    <div id="search-bar" class="hidden bg-slate-900/95 backdrop-blur border-b border-sky-500/40 shadow-lg shadow-black/40">
+      <div class="max-w-5xl mx-auto px-4 py-2.5 flex items-center gap-4">
+        <svg class="h-5 w-5 text-sky-400 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>
+        </svg>
+        <div class="min-w-0 flex-1">
+          <div id="search-progress-text" class="text-sm text-slate-200 truncate">Searching…</div>
+          <div class="mt-1.5 h-1.5 bg-slate-800 rounded-full overflow-hidden">
+            <div id="search-progress-bar" class="h-full bg-sky-500 rounded-full transition-all duration-300" style="width: 0%"></div>
+          </div>
+        </div>
+        <div class="flex items-center gap-3 shrink-0 text-xs">
+          <span id="search-progress-fraction" class="text-slate-400"></span>
+          <button id="search-bar-close" type="button" aria-label="Dismiss" class="text-slate-500 hover:text-slate-300 text-lg leading-none px-1">&times;</button>
         </div>
       </div>
-      <div class="flex items-center gap-3 shrink-0 text-xs">
-        <span id="progress-fraction" class="text-slate-400"></span>
-        <span id="progress-counts" class="hidden sm:flex items-center gap-2.5"></span>
-        <button id="dl-bar-close" type="button" aria-label="Dismiss" class="text-slate-500 hover:text-slate-300 text-lg leading-none px-1">&times;</button>
+    </div>
+    <div id="dl-bar" class="hidden bg-slate-900/95 backdrop-blur border-b border-indigo-500/40 shadow-lg shadow-black/40">
+      <div class="max-w-5xl mx-auto px-4 py-2.5 flex items-center gap-4">
+        <svg class="h-5 w-5 text-indigo-400 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 3v12"/><path d="M8 11l4 4 4-4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/>
+        </svg>
+        <div class="min-w-0 flex-1">
+          <div id="progress-text" class="text-sm text-slate-200 truncate">Queued…</div>
+          <div class="mt-1.5 h-1.5 bg-slate-800 rounded-full overflow-hidden">
+            <div id="progress-bar" class="h-full bg-indigo-500 rounded-full transition-all duration-300" style="width: 0%"></div>
+          </div>
+        </div>
+        <div class="flex items-center gap-3 shrink-0 text-xs">
+          <span id="progress-fraction" class="text-slate-400"></span>
+          <span id="progress-counts" class="hidden sm:flex items-center gap-2.5"></span>
+          <button id="dl-bar-close" type="button" aria-label="Dismiss" class="text-slate-500 hover:text-slate-300 text-lg leading-none px-1">&times;</button>
+        </div>
       </div>
     </div>
   </div>

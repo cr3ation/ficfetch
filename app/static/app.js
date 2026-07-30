@@ -76,6 +76,8 @@ es.addEventListener("log", (e) => appendLog(JSON.parse(e.data)));
 
 es.addEventListener("progress", (e) => showProgress(JSON.parse(e.data)));
 
+es.addEventListener("search_progress", (e) => updateSearchProgress(JSON.parse(e.data)));
+
 es.addEventListener("item_done", (e) => {
   const d = JSON.parse(e.data);
   markRow(d.work_id, d.status, d.message);
@@ -231,7 +233,9 @@ $("search-form").addEventListener("submit", async (e) => {
   const query = $("query").value.trim();
   if (!query) return;
 
+  const maxResults = parseInt($("max-results").value, 10) || 100;
   setSearching(true);
+  showSearchBar(maxResults);
   try {
     const resp = await fetch("/api/search", {
       method: "POST",
@@ -239,7 +243,7 @@ $("search-form").addEventListener("submit", async (e) => {
       body: JSON.stringify({
         query,
         search_type: state.searchType,
-        max_results: parseInt($("max-results").value, 10) || 100,
+        max_results: maxResults,
         sort_by: $("sort-by").value,
         ...readFilters(),
       }),
@@ -256,6 +260,7 @@ $("search-form").addEventListener("submit", async (e) => {
     appendLog({ level: "error", message: `Search request failed: ${err.message}` });
   } finally {
     setSearching(false);
+    hideSearchBar();
   }
 });
 
@@ -264,6 +269,29 @@ function setSearching(on) {
   $("search-spinner").classList.toggle("hidden", !on);
   $("search-btn-label").textContent = on ? "Searching..." : "Search";
 }
+
+// Sticky search progress bar — mirrors the download bar's show/hide/update
+// idiom, but visibility is owned entirely by the fetch() lifecycle above
+// rather than by SSE (search has no persistent job to resume on reconnect).
+function showSearchBar(total) {
+  $("search-progress-text").textContent = "Searching…";
+  $("search-progress-fraction").textContent = `0 / ${total}`;
+  $("search-progress-bar").style.width = "0%";
+  $("search-bar").classList.remove("hidden");
+  syncBarPadding();
+}
+
+function hideSearchBar() {
+  $("search-bar").classList.add("hidden");
+  syncBarPadding();
+}
+
+function updateSearchProgress({ current, total }) {
+  $("search-progress-fraction").textContent = `${current} / ${total}`;
+  $("search-progress-bar").style.width = `${Math.round((current / total) * 100)}%`;
+}
+
+$("search-bar-close").addEventListener("click", hideSearchBar);
 
 // ---------------------------------------------------------------- Results table
 
@@ -585,16 +613,23 @@ function showProgress({ current, total, title }) {
   renderDlCounts(state.dlCounts.done, state.dlCounts.skipped, state.dlCounts.error);
 }
 
-// The sticky download bar shifts the page down while visible so it never
-// covers the header — mirrors the #connection-banner fixed idiom.
+// The sticky bars shift the page down while visible so they never cover the
+// header — mirrors the #connection-banner fixed idiom. #search-bar and
+// #dl-bar are both plain-flow children of #sticky-bars, so its own
+// offsetHeight already accounts for however many of them are shown.
 function showDlBar() {
   $("dl-bar").classList.remove("hidden");
-  document.body.style.paddingTop = "56px";
+  syncBarPadding();
 }
 
 function hideDlBar() {
   $("dl-bar").classList.add("hidden");
-  document.body.style.paddingTop = "";
+  syncBarPadding();
+}
+
+function syncBarPadding() {
+  const h = $("sticky-bars").offsetHeight;
+  document.body.style.paddingTop = h ? `${h}px` : "";
 }
 
 function renderDlCounts(done, skipped, error) {
