@@ -1,5 +1,9 @@
 "use strict";
 
+const BAR_FADE_MS = 300; // matches the bars' transition-opacity duration-300
+const SEARCH_BAR_HOLD_MS = 2000; // no tally to read, results table is right below
+const DL_BAR_HOLD_MS = 6000; // long enough to read the done/skipped/failed tally
+
 const state = {
   results: new Map(), // work_id -> Work
   order: [], // work_ids in server-returned order
@@ -97,7 +101,7 @@ es.addEventListener("job_done", (e) => {
   // Leave the final tally up briefly, then retract the bar (the full detail
   // stays in the activity log below).
   clearTimeout(state.dlHideTimer);
-  state.dlHideTimer = setTimeout(hideDlBar, 6000);
+  state.dlHideTimer = setTimeout(hideDlBar, DL_BAR_HOLD_MS);
 });
 
 es.onerror = () => {
@@ -256,6 +260,9 @@ $("search-form").addEventListener("submit", async (e) => {
     const data = await resp.json();
     state.lastQuery = query;
     renderResults(data);
+    $("search-progress-text").textContent = "Search complete";
+    $("search-progress-fraction").textContent = `${(data.works || []).length} / ${maxResults}`;
+    $("search-progress-bar").style.width = "100%";
   } catch (err) {
     appendLog({ level: "error", message: `Search request failed: ${err.message}` });
   } finally {
@@ -277,13 +284,11 @@ function showSearchBar(total) {
   $("search-progress-text").textContent = "Searching…";
   $("search-progress-fraction").textContent = `0 / ${total}`;
   $("search-progress-bar").style.width = "0%";
-  $("search-bar").classList.remove("hidden");
-  syncBarPadding();
+  showBar($("search-bar"), "searchHideTimer", "searchFadeTimer");
 }
 
 function hideSearchBar() {
-  $("search-bar").classList.add("hidden");
-  syncBarPadding();
+  scheduleBarHide($("search-bar"), SEARCH_BAR_HOLD_MS, "searchHideTimer", "searchFadeTimer");
 }
 
 function updateSearchProgress({ current, total }) {
@@ -291,7 +296,10 @@ function updateSearchProgress({ current, total }) {
   $("search-progress-bar").style.width = `${Math.round((current / total) * 100)}%`;
 }
 
-$("search-bar-close").addEventListener("click", hideSearchBar);
+$("search-bar-close").addEventListener("click", () => {
+  clearTimeout(state.searchHideTimer);
+  startBarFade($("search-bar"), "searchFadeTimer");
+});
 
 // ---------------------------------------------------------------- Results table
 
@@ -617,14 +625,43 @@ function showProgress({ current, total, title }) {
 // header — mirrors the #connection-banner fixed idiom. #search-bar and
 // #dl-bar are both plain-flow children of #sticky-bars, so its own
 // offsetHeight already accounts for however many of them are shown.
-function showDlBar() {
-  $("dl-bar").classList.remove("hidden");
+//
+// Hiding is two-phase since Tailwind's `hidden` (display:none) can't be
+// transitioned: fade opacity to 0 first, then apply `hidden` once the
+// transition has actually finished, so content below never jumps while the
+// bar is still occupying space but fading.
+function showBar(el, holdTimerKey, fadeTimerKey) {
+  clearTimeout(state[holdTimerKey]);
+  clearTimeout(state[fadeTimerKey]);
+  el.classList.remove("hidden", "opacity-0");
+  el.classList.add("opacity-100");
   syncBarPadding();
 }
 
+function startBarFade(el, fadeTimerKey) {
+  el.classList.remove("opacity-100");
+  el.classList.add("opacity-0");
+  clearTimeout(state[fadeTimerKey]);
+  state[fadeTimerKey] = setTimeout(() => {
+    el.classList.add("hidden");
+    el.classList.remove("opacity-0");
+    el.classList.add("opacity-100"); // reset so the next show is instantly fully visible
+    syncBarPadding();
+  }, BAR_FADE_MS);
+}
+
+function scheduleBarHide(el, holdMs, holdTimerKey, fadeTimerKey) {
+  clearTimeout(state[holdTimerKey]);
+  state[holdTimerKey] = setTimeout(() => startBarFade(el, fadeTimerKey), holdMs);
+}
+
+function showDlBar() {
+  showBar($("dl-bar"), "dlHideTimer", "dlFadeTimer");
+}
+
 function hideDlBar() {
-  $("dl-bar").classList.add("hidden");
-  syncBarPadding();
+  clearTimeout(state.dlHideTimer);
+  startBarFade($("dl-bar"), "dlFadeTimer");
 }
 
 function syncBarPadding() {
@@ -639,7 +676,10 @@ function renderDlCounts(done, skipped, error) {
     `<span class="text-red-400">${error} failed</span>`;
 }
 
-$("dl-bar-close").addEventListener("click", hideDlBar);
+$("dl-bar-close").addEventListener("click", () => {
+  clearTimeout(state.dlHideTimer);
+  startBarFade($("dl-bar"), "dlFadeTimer");
+});
 
 // ---------------------------------------------------------------- Library
 
