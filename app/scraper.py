@@ -241,6 +241,7 @@ async def search(
     params = build_listing_params(req)
 
     works: list[Work] = []
+    seen_ids: set[str] = set()
     page = 1
     fallback_attempted = False
     while page <= settings.max_pages and len(works) < max_results:
@@ -286,7 +287,13 @@ async def search(
                 bus.log("info", f"No works found for '{query}'.")
             break
 
-        works.extend(page_works)
+        # AO3's search index can shift slightly between paginated requests,
+        # occasionally repeating a work across two "pages" — guard against
+        # that (and any other future source of overlap) structurally rather
+        # than trusting each page to be disjoint from the last.
+        new_works = [w for w in page_works if w.work_id not in seen_ids]
+        seen_ids.update(w.work_id for w in new_works)
+        works.extend(new_works)
         found = min(len(works), max_results)
         bus.log("info", f"Page {page}: found {len(page_works)} works ({found} total).")
         bus.publish("search_progress", {"current": found, "total": max_results})
