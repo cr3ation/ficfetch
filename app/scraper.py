@@ -242,16 +242,35 @@ async def search(
 
     works: list[Work] = []
     page = 1
+    fallback_attempted = False
     while page <= settings.max_pages and len(works) < max_results:
-        resp = await client.get(base, params={**params, "page": page, "view_adult": "true"})
+        request_params = {**params, "page": page, "view_adult": "true"}
+        resp = await client.get(base, params=request_params)
+
+        if resp.history:
+            # AO3 redirects non-canonical tags (e.g. "Hermione" -> "Hermione
+            # Granger") with a Location that carries no query string at all,
+            # silently dropping page/sort/filters — every "page" would else
+            # land back on the redirected page 1. Point base at the real
+            # destination and redo this request with our params intact.
+            new_base = str(resp.url).split("?", 1)[0]
+            new_label = urllib.parse.unquote(resp.url.path)
+            bus.log("info", f"'{query}' redirected to {new_label} — retrying with your search parameters attached.")
+            base = new_base
+            resp = await client.get(base, params=request_params)
 
         if resp.status_code == 404:
             if page > 1:
                 break
             if req.search_type == "author":
                 return [], f"User '{query}' not found on AO3.", False
+            if fallback_attempted:
+                bus.log("warning", f"Generic work search for '{query}' also found no results — giving up.")
+                message = f"Tag '{query}' not found, and the fallback search found no results either."
+                break
             # Tag page missing: fall back to the generic work search. Filters and
             # sort survive the switch — params are rebuilt from the same request.
+            fallback_attempted = True
             bus.log("warning", f"Tag page for '{query}' not found — falling back to generic work search.")
             message = f"Tag '{query}' not found — showing generic search results instead."
             base = f"{settings.base_url}/works/search"
