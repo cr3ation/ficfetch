@@ -1,7 +1,13 @@
 """In-process pub/sub bus feeding Server-Sent Events to connected browsers."""
 import asyncio
 import json
+from contextvars import ContextVar
 from datetime import datetime, timezone
+
+# Set for the duration of one search request. Every event published from inside
+# it (scraper and AO3Client logs included) carries the id, so a browser can tell
+# its own current search apart from one it has already abandoned.
+current_search_id: ContextVar[str | None] = ContextVar("current_search_id", default=None)
 
 
 class EventBus:
@@ -19,6 +25,9 @@ class EventBus:
 
     def publish(self, event: str, data: dict) -> None:
         """Non-blocking: safe to call from the download worker without await."""
+        search_id = current_search_id.get()
+        if search_id:
+            data = {**data, "search_id": search_id}
         frame = f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
         for q in self._subscribers:
             try:
