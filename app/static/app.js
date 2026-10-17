@@ -19,6 +19,9 @@ const state = {
   library: { categories: [], loaded: false },
   activeTab: "search",
   dlCounts: { done: 0, skipped: 0, error: 0 }, // running tally for the download bar
+  searchId: null, // id of this tab's in-flight search, echoed on its SSE events
+  searchAbort: null, // AbortController for that search's fetch
+  staleSearches: new Set(), // ids this tab abandoned — their late events are dropped
 };
 
 const $ = (id) => document.getElementById(id);
@@ -76,11 +79,19 @@ es.addEventListener("snapshot", (e) => {
   if (snap.current) showProgress(snap.current);
 });
 
-es.addEventListener("log", (e) => appendLog(JSON.parse(e.data)));
+es.addEventListener("log", (e) => {
+  const d = JSON.parse(e.data);
+  if (d.search_id && state.staleSearches.has(d.search_id)) return;
+  appendLog(d);
+});
 
 es.addEventListener("progress", (e) => showProgress(JSON.parse(e.data)));
 
-es.addEventListener("search_progress", (e) => updateSearchProgress(JSON.parse(e.data)));
+es.addEventListener("search_progress", (e) => {
+  const d = JSON.parse(e.data);
+  // Only this tab's current search drives the bar — not another tab's, nor an abandoned one.
+  if (d.search_id === state.searchId) updateSearchProgress(d);
+});
 
 es.addEventListener("item_done", (e) => {
   const d = JSON.parse(e.data);
@@ -238,13 +249,25 @@ $("search-form").addEventListener("submit", async (e) => {
   if (!query) return;
 
   const maxResults = parseInt($("max-results").value, 10) || 100;
+  // Supersede any search still in flight: aborting the fetch drops the
+  // connection, which makes the server cancel that search too.
+  if (state.searchAbort) {
+    state.staleSearches.add(state.searchId);
+    state.searchAbort.abort();
+  }
+  const searchId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  const abort = new AbortController();
+  state.searchId = searchId;
+  state.searchAbort = abort;
   setSearching(true);
   showSearchBar(maxResults);
   try {
     const resp = await fetch("/api/search", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      signal: abort.signal,
       body: JSON.stringify({
+        search_id: searchId,
         query,
         search_type: state.searchType,
         max_results: maxResults,
@@ -264,10 +287,22 @@ $("search-form").addEventListener("submit", async (e) => {
     $("search-progress-fraction").textContent = `${(data.works || []).length} / ${maxResults}`;
     $("search-progress-bar").style.width = "100%";
   } catch (err) {
-    appendLog({ level: "error", message: `Search request failed: ${err.message}` });
+    if (err.name === "AbortError") return; // superseded by a newer search
+    // The browser or a proxy gave up on the long request. The server notices
+    // the dropped connection and stops the search, so a retry starts clean.
+    state.staleSearches.add(searchId);
+    appendLog({
+      level: "error",
+      message: `Search request failed: ${err.message} — the connection dropped, so the search was stopped. Try again.`,
+    });
   } finally {
-    setSearching(false);
-    hideSearchBar();
+    // A superseding search owns the button and bar now; leave them alone.
+    if (state.searchId === searchId) {
+      state.searchId = null;
+      state.searchAbort = null;
+      setSearching(false);
+      hideSearchBar();
+    }
   }
 });
 

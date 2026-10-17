@@ -23,12 +23,14 @@ from .downloader import (
     load_metadata,
     remove_metadata_entry,
 )
-from .events import EventBus
+from .events import EventBus, current_search_id
 from .models import EnqueueRequest, SearchRequest, SearchResponse
 from .utils import safe_child
 
 APP_DIR = Path(__file__).parent
 SSE_KEEPALIVE_SECONDS = 15
+# How often a running search checks whether its browser is still connected.
+DISCONNECT_POLL_SECONDS = 1.0
 # Pseudo-category addressing files directly in the downloads root (flat mode).
 ROOT_CATEGORY = "_root"
 
@@ -133,15 +135,43 @@ async def api_search(req: SearchRequest, request: Request) -> SearchResponse:
 
     max_results = max(1, min(req.max_results, settings.max_results_cap))
     bus: EventBus = request.app.state.bus
+    token = current_search_id.set(req.search_id)
+    try:
+        return await _run_search(request, settings, bus, req, max_results)
+    finally:
+        current_search_id.reset(token)
+
+
+async def _run_search(
+    request: Request, settings: Settings, bus: EventBus, req: SearchRequest, max_results: int
+) -> SearchResponse | Response:
+    query = req.query
     bus.log("info", f"Searching {req.search_type} '{query}' (max {max_results} works)...")
 
+    # Starlette never cancels a plain endpoint when its client goes away, so a
+    # search the browser gave up on (fetch timeout, proxy timeout, reload) would
+    # keep paging AO3 to the end — competing with the next search for the
+    # shared rate-limit lock. Run it as a task and cancel it on disconnect.
+    task = asyncio.create_task(
+        scraper.search(request.app.state.client, settings, bus, req, max_results)
+    )
     try:
-        works, message, truncated = await scraper.search(
-            request.app.state.client, settings, bus, req, max_results
-        )
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=DISCONNECT_POLL_SECONDS)
+            if done:
+                break
+            if await request.is_disconnected():
+                task.cancel()
+                bus.log("warning", f"Search for '{query}' cancelled — the browser disconnected.")
+                # Nobody is listening; nginx's "client closed request" code for the access log.
+                return Response(status_code=499)
+        works, message, truncated = task.result()
     except AO3Error as exc:
         bus.log("error", f"Search failed: {exc}")
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    finally:
+        # Also covers this handler itself being cancelled (e.g. shutdown).
+        task.cancel()
 
     known = downloaded_formats(settings)
     downloaded = {w.work_id: known[w.work_id] for w in works if w.work_id in known}

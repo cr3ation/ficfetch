@@ -38,6 +38,8 @@ class SearchRequest(BaseModel):
     words_from: int | None = Field(default=None, ge=0)
     words_to: int | None = Field(default=None, ge=0)
     exclude_tags: list[str] = Field(default_factory=list)
+    # Client-chosen tag echoed on this search's SSE events (see events.current_search_id).
+    search_id: str | None = Field(default=None, max_length=64)
 
 
 class SearchResponse(BaseModel):
