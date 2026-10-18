@@ -12,6 +12,12 @@ from .models import SearchRequest, Work
 from .utils import encode_tag, parse_work_ref
 
 WORKS_PER_PAGE = 20
+# A listing that redirects more often than this in a row is a loop, not a rename.
+MAX_LISTING_REDIRECTS = 3
+
+# Listing base URL -> where AO3 redirected it (non-canonical tag -> canonical).
+# Resolving "star wars" alone has taken AO3 30+ s, so a retry skips the lookup.
+_listing_redirects: dict[str, str] = {}
 
 
 def _parse_count(scope, selector: str) -> int | None:
@@ -238,6 +244,7 @@ async def search(
         base = f"{settings.base_url}/users/{urllib.parse.quote(query)}/works"
     else:
         base = f"{settings.base_url}/tags/{encode_tag(query)}/works"
+    base = _listing_redirects.get(base, base)
     params = build_listing_params(req)
 
     works: list[Work] = []
@@ -246,19 +253,26 @@ async def search(
     fallback_attempted = False
     while page <= settings.max_pages and len(works) < max_results:
         request_params = {**params, "page": page, "view_adult": "true"}
-        resp = await client.get(base, params=request_params)
-
-        if resp.history:
-            # AO3 redirects non-canonical tags (e.g. "Hermione" -> "Hermione
-            # Granger") with a Location that carries no query string at all,
-            # silently dropping page/sort/filters — every "page" would else
-            # land back on the redirected page 1. Point base at the real
-            # destination and redo this request with our params intact.
-            new_base = str(resp.url).split("?", 1)[0]
-            new_label = urllib.parse.unquote(resp.url.path)
+        # AO3 redirects non-canonical tags (e.g. "Hermione" -> "Hermione
+        # Granger") with a Location that carries no query string at all,
+        # silently dropping page/sort/filters. Redirects are therefore not
+        # followed: following one would download the whole unfiltered page
+        # just to throw it away — on a big fandom a 100 s AO3 request.
+        # Point base at the real destination and redo the request instead.
+        original_base = base
+        for _ in range(MAX_LISTING_REDIRECTS + 1):
+            resp = await client.get(base, params=request_params, follow_redirects=False)
+            if not resp.is_redirect:
+                break
+            base = urllib.parse.urljoin(base, resp.headers["location"]).split("?", 1)[0]
+            new_label = urllib.parse.unquote(urllib.parse.urlparse(base).path)
             bus.log("info", f"'{query}' redirected to {new_label} — retrying with your search parameters attached.")
-            base = new_base
-            resp = await client.get(base, params=request_params)
+        else:
+            raise AO3Error(f"Too many redirects fetching {original_base}")
+        # Only remember renames that land on another listing; a bounce to an
+        # error or front page must not stick for every later search.
+        if base != original_base and base.endswith("/works"):
+            _listing_redirects[original_base] = base
 
         if resp.status_code == 404:
             if page > 1:

@@ -25,6 +25,13 @@ class RestrictedWorkError(Exception):
     pass
 
 
+def _cloudflare_hint(status: int) -> str:
+    """AO3 sits behind Cloudflare: 52x means Cloudflare couldn't get an answer from AO3."""
+    if 520 <= status <= 527:
+        return " (Cloudflare couldn't reach AO3 — AO3 is likely overloaded)"
+    return ""
+
+
 class AO3Client:
     def __init__(self, settings: Settings, bus: EventBus) -> None:
         self._settings = settings
@@ -42,7 +49,9 @@ class AO3Client:
             timeout=settings.request_timeout,
         )
 
-    async def get(self, url: str, *, params: dict | None = None) -> httpx.Response:
+    async def get(
+        self, url: str, *, params: dict | None = None, follow_redirects: bool = True
+    ) -> httpx.Response:
         s = self._settings
         async with self._lock:
             for attempt in range(s.max_retries + 1):
@@ -52,7 +61,7 @@ class AO3Client:
                     await asyncio.sleep(wait)
 
                 try:
-                    resp = await self._client.get(url, params=params)
+                    resp = await self._client.get(url, params=params, follow_redirects=follow_redirects)
                 except httpx.HTTPError as exc:
                     self._last_request = time.monotonic()
                     if attempt >= s.max_retries:
@@ -81,7 +90,11 @@ class AO3Client:
                     if attempt >= s.max_retries:
                         raise AO3Error(f"AO3 server error {resp.status_code} for {url}")
                     delay = min(10 * (2**attempt), 120)
-                    self._bus.log("warning", f"AO3 server error {resp.status_code}, retrying in {int(delay)}s...")
+                    self._bus.log(
+                        "warning",
+                        f"AO3 server error {resp.status_code}{_cloudflare_hint(resp.status_code)}, "
+                        f"retrying in {int(delay)}s...",
+                    )
                     await asyncio.sleep(delay)
                     continue
 

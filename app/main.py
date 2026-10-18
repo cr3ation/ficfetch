@@ -11,8 +11,8 @@ from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from . import covers, db, routes_auth, routes_prefs, routes_system, scraper
-from .ao3_client import AO3Client, AO3Error
+from . import covers, db, routes_auth, routes_prefs, routes_system
+from .ao3_client import AO3Client
 from .auth import AuthMiddleware
 from .bootstrap import apply_password_reset, seed_admin
 from .config import Settings
@@ -23,14 +23,13 @@ from .downloader import (
     load_metadata,
     remove_metadata_entry,
 )
-from .events import EventBus, current_search_id
-from .models import EnqueueRequest, SearchRequest, SearchResponse
+from .events import EventBus
+from .models import EnqueueRequest, SearchRequest
+from .searches import DuplicateSearchError, SearchManager
 from .utils import safe_child
 
 APP_DIR = Path(__file__).parent
 SSE_KEEPALIVE_SECONDS = 15
-# How often a running search checks whether its browser is still connected.
-DISCONNECT_POLL_SECONDS = 1.0
 # Pseudo-category addressing files directly in the downloads root (flat mode).
 ROOT_CATEGORY = "_root"
 
@@ -67,6 +66,7 @@ async def lifespan(app: FastAPI):
     bus = EventBus()
     client = AO3Client(settings, bus)
     manager = DownloadManager(client, settings, bus)
+    searches = SearchManager(client, settings, bus)
     settings.downloads_dir.mkdir(parents=True, exist_ok=True)
     settings.config_dir.mkdir(parents=True, exist_ok=True)
     _migrate_metadata(settings, bus)
@@ -86,8 +86,10 @@ async def lifespan(app: FastAPI):
     app.state.bus = bus
     app.state.client = client
     app.state.manager = manager
+    app.state.searches = searches
     app.state.templates = Jinja2Templates(directory=APP_DIR / "templates")
     yield
+    await searches.stop()
     await manager.stop()
     await client.close()
 
@@ -125,8 +127,9 @@ async def healthz() -> dict:
     return {"status": "ok"}
 
 
-@app.post("/api/search")
-async def api_search(req: SearchRequest, request: Request) -> SearchResponse:
+@app.post("/api/search", status_code=202)
+async def api_search(req: SearchRequest, request: Request) -> dict:
+    """Start a search job; progress and `search_done` arrive over /api/events."""
     settings: Settings = request.app.state.settings
     query = req.query.strip()
     if not query:
@@ -134,54 +137,31 @@ async def api_search(req: SearchRequest, request: Request) -> SearchResponse:
     req.query = query
 
     max_results = max(1, min(req.max_results, settings.max_results_cap))
-    bus: EventBus = request.app.state.bus
-    token = current_search_id.set(req.search_id)
+    searches: SearchManager = request.app.state.searches
     try:
-        return await _run_search(request, settings, bus, req, max_results)
-    finally:
-        current_search_id.reset(token)
+        job = searches.start(request.state.user.id, req, max_results)
+    except DuplicateSearchError:
+        raise HTTPException(status_code=409, detail="A search with this id already exists.")
+    return {"search_id": job.search_id}
 
 
-async def _run_search(
-    request: Request, settings: Settings, bus: EventBus, req: SearchRequest, max_results: int
-) -> SearchResponse | Response:
-    query = req.query
-    bus.log("info", f"Searching {req.search_type} '{query}' (max {max_results} works)...")
+@app.get("/api/search/{search_id}")
+async def api_search_result(search_id: str, request: Request) -> dict:
+    searches: SearchManager = request.app.state.searches
+    job = searches.get(search_id, request.state.user.id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Search not found (results expire after a while).")
+    return job.detail()
 
-    # Starlette never cancels a plain endpoint when its client goes away, so a
-    # search the browser gave up on (fetch timeout, proxy timeout, reload) would
-    # keep paging AO3 to the end — competing with the next search for the
-    # shared rate-limit lock. Run it as a task and cancel it on disconnect.
-    task = asyncio.create_task(
-        scraper.search(request.app.state.client, settings, bus, req, max_results)
-    )
-    try:
-        while True:
-            done, _ = await asyncio.wait({task}, timeout=DISCONNECT_POLL_SECONDS)
-            if done:
-                break
-            if await request.is_disconnected():
-                task.cancel()
-                bus.log("warning", f"Search for '{query}' cancelled — the browser disconnected.")
-                # Nobody is listening; nginx's "client closed request" code for the access log.
-                return Response(status_code=499)
-        works, message, truncated = task.result()
-    except AO3Error as exc:
-        bus.log("error", f"Search failed: {exc}")
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    finally:
-        # Also covers this handler itself being cancelled (e.g. shutdown).
-        task.cancel()
 
-    known = downloaded_formats(settings)
-    downloaded = {w.work_id: known[w.work_id] for w in works if w.work_id in known}
-
-    bus.log(
-        "info",
-        f"Search finished: {len(works)} works for '{query}'"
-        + (f" ({len(downloaded)} already in your library)." if downloaded else "."),
-    )
-    return SearchResponse(works=works, message=message, truncated=truncated, downloaded=downloaded)
+# POST rather than DELETE so navigator.sendBeacon can call it when a tab closes.
+@app.post("/api/search/{search_id}/cancel")
+async def api_search_cancel(search_id: str, request: Request) -> dict:
+    searches: SearchManager = request.app.state.searches
+    job = searches.cancel(search_id, request.state.user.id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Search not found.")
+    return {"search_id": job.search_id, "status": job.status}
 
 
 @app.post("/api/download")
