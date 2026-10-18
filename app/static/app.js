@@ -3,6 +3,7 @@
 const BAR_FADE_MS = 300; // matches the bars' transition-opacity duration-300
 const SEARCH_BAR_HOLD_MS = 2000; // no tally to read, results table is right below
 const DL_BAR_HOLD_MS = 6000; // long enough to read the done/skipped/failed tally
+const FINISH_RETRY_MS = 3000; // retry fetching a finished search's result after a network blip
 
 const state = {
   results: new Map(), // work_id -> Work
@@ -19,8 +20,8 @@ const state = {
   library: { categories: [], loaded: false },
   activeTab: "search",
   dlCounts: { done: 0, skipped: 0, error: 0 }, // running tally for the download bar
-  searchId: null, // id of this tab's in-flight search, echoed on its SSE events
-  searchAbort: null, // AbortController for that search's fetch
+  searchId: null, // id of this tab's running search job, echoed on its SSE events
+  searchMax: 0, // that search's max_results, for the bar's final fraction
   staleSearches: new Set(), // ids this tab abandoned — their late events are dropped
 };
 
@@ -77,6 +78,8 @@ es.addEventListener("snapshot", (e) => {
   hideBanner();
   const snap = JSON.parse(e.data);
   if (snap.current) showProgress(snap.current);
+  // A reconnect may have swallowed our search's search_done — ask directly.
+  if (state.searchId) finishSearch(state.searchId);
 });
 
 es.addEventListener("log", (e) => {
@@ -91,6 +94,11 @@ es.addEventListener("search_progress", (e) => {
   const d = JSON.parse(e.data);
   // Only this tab's current search drives the bar — not another tab's, nor an abandoned one.
   if (d.search_id === state.searchId) updateSearchProgress(d);
+});
+
+es.addEventListener("search_done", (e) => {
+  const d = JSON.parse(e.data);
+  if (d.search_id === state.searchId) finishSearch(d.search_id);
 });
 
 es.addEventListener("item_done", (e) => {
@@ -243,29 +251,58 @@ $("clear-filters").addEventListener("click", () => {
   paintFilterChip();
 });
 
-$("search-form").addEventListener("submit", async (e) => {
+$("search-form").addEventListener("submit", (e) => {
   e.preventDefault();
+  startSearch();
+});
+
+// While a search runs the button is a Cancel button (type=button), which
+// leaves the form without a submit button — so Enter would do nothing. Keep
+// Enter starting a new search, superseding the running one.
+$("search-form").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && state.searchId && e.target.matches("input:not([type=checkbox])")) {
+    e.preventDefault();
+    startSearch();
+  }
+});
+
+$("search-btn").addEventListener("click", (e) => {
+  if (!state.searchId) return; // idle: an ordinary submit
+  // abandonSearch() flips the button back to type=submit before the browser
+  // runs its default action, which would then submit a fresh search.
+  e.preventDefault();
+  appendLog({ level: "warning", message: "Search cancelled." });
+  abandonSearch(state.searchId);
+});
+
+// A closed tab can't receive the result, so stop its search rather than let it
+// hold AO3's rate limit (and any queued downloads) until it finishes.
+window.addEventListener("pagehide", () => {
+  if (state.searchId) navigator.sendBeacon(`/api/search/${state.searchId}/cancel`);
+});
+// ...and if the page comes back from the back/forward cache, settle that search.
+window.addEventListener("pageshow", (e) => {
+  if (e.persisted && state.searchId) finishSearch(state.searchId);
+});
+
+// Searches run as server-side jobs: the POST returns at once, progress streams
+// over SSE, and search_done triggers finishSearch() to fetch the result. No
+// request stays open, so a slow AO3 can't trip a browser or proxy timeout.
+async function startSearch() {
   const query = $("query").value.trim();
   if (!query) return;
 
   const maxResults = parseInt($("max-results").value, 10) || 100;
-  // Supersede any search still in flight: aborting the fetch drops the
-  // connection, which makes the server cancel that search too.
-  if (state.searchAbort) {
-    state.staleSearches.add(state.searchId);
-    state.searchAbort.abort();
-  }
+  if (state.searchId) abandonSearch(state.searchId); // a new search supersedes
   const searchId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-  const abort = new AbortController();
   state.searchId = searchId;
-  state.searchAbort = abort;
+  state.searchMax = maxResults;
   setSearching(true);
   showSearchBar(maxResults);
   try {
     const resp = await fetch("/api/search", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      signal: abort.signal,
       body: JSON.stringify({
         search_id: searchId,
         query,
@@ -277,44 +314,75 @@ $("search-form").addEventListener("submit", async (e) => {
     });
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));
-      appendLog({ level: "error", message: `Search failed: ${err.detail || resp.statusText}` });
+      // A proxy's error page has no JSON detail, and over HTTP/2 no statusText.
+      appendLog({ level: "error", message: `Search failed: ${err.detail || resp.statusText || `HTTP ${resp.status}`}` });
+      abandonSearch(searchId);
+    }
+  } catch (err) {
+    appendLog({ level: "error", message: `Search request failed: ${err.message}` });
+    abandonSearch(searchId); // the job may have started even though the reply was lost
+  }
+}
+
+async function finishSearch(id, attempt = 0) {
+  let job;
+  try {
+    const resp = await fetch(`/api/search/${id}`);
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.detail || resp.statusText || `HTTP ${resp.status}`);
+    }
+    job = await resp.json();
+  } catch (err) {
+    if (state.searchId !== id) return;
+    // fetch() rejects with a TypeError only for network failures. The result
+    // waits on the server for minutes, so keep trying until the link is back.
+    if (err instanceof TypeError) {
+      if (attempt === 0) {
+        appendLog({ level: "warning", message: `Couldn't fetch search results (${err.message}) — retrying…` });
+      }
+      setTimeout(() => state.searchId === id && finishSearch(id, attempt + 1), FINISH_RETRY_MS);
       return;
     }
-    const data = await resp.json();
-    state.lastQuery = query;
-    renderResults(data);
-    $("search-progress-text").textContent = "Search complete";
-    $("search-progress-fraction").textContent = `${(data.works || []).length} / ${maxResults}`;
-    $("search-progress-bar").style.width = "100%";
-  } catch (err) {
-    if (err.name === "AbortError") return; // superseded by a newer search
-    // The browser or a proxy gave up on the long request. The server notices
-    // the dropped connection and stops the search, so a retry starts clean.
-    state.staleSearches.add(searchId);
-    appendLog({
-      level: "error",
-      message: `Search request failed: ${err.message} — the connection dropped, so the search was stopped. Try again.`,
-    });
-  } finally {
-    // A superseding search owns the button and bar now; leave them alone.
-    if (state.searchId === searchId) {
-      state.searchId = null;
-      state.searchAbort = null;
-      setSearching(false);
-      hideSearchBar();
-    }
+    appendLog({ level: "error", message: `Could not fetch search results: ${err.message}` });
+    endSearch();
+    return;
   }
-});
+  // Superseded while fetching, or still running (a reconnect check).
+  if (state.searchId !== id || job.status === "running") return;
+  if (job.status === "done") {
+    state.lastQuery = job.query;
+    renderResults(job.result);
+    $("search-progress-text").textContent = "Search complete";
+    $("search-progress-fraction").textContent = `${job.result.works.length} / ${state.searchMax}`;
+    $("search-progress-bar").style.width = "100%";
+  }
+  // error/cancelled: the server's own log line already says why.
+  endSearch();
+}
+
+// Stop following a search: drop its late events and tell the server to stop it.
+function abandonSearch(id) {
+  state.staleSearches.add(id);
+  fetch(`/api/search/${id}/cancel`, { method: "POST" }).catch(() => {});
+  if (state.searchId === id) endSearch();
+}
+
+function endSearch() {
+  state.searchId = null;
+  setSearching(false);
+  hideSearchBar();
+}
 
 function setSearching(on) {
-  $("search-btn").disabled = on;
+  // Running, the button cancels; type=button stops it from submitting the form.
+  $("search-btn").type = on ? "button" : "submit";
   $("search-spinner").classList.toggle("hidden", !on);
-  $("search-btn-label").textContent = on ? "Searching..." : "Search";
+  $("search-btn-label").textContent = on ? "Cancel" : "Search";
 }
 
 // Sticky search progress bar — mirrors the download bar's show/hide/update
-// idiom, but visibility is owned entirely by the fetch() lifecycle above
-// rather than by SSE (search has no persistent job to resume on reconnect).
+// idiom; shown by startSearch() and retracted by endSearch().
 function showSearchBar(total) {
   $("search-progress-text").textContent = "Searching…";
   $("search-progress-fraction").textContent = `0 / ${total}`;

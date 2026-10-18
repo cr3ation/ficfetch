@@ -45,7 +45,7 @@ class Settings:
             backoff_base=float(os.getenv("RETRY_BACKOFF_BASE", "30")),
             backoff_cap=float(os.getenv("RETRY_BACKOFF_CAP", "600")),
             retry_after_cap=float(os.getenv("RETRY_AFTER_CAP", "1800")),
-            request_timeout=float(os.getenv("REQUEST_TIMEOUT", "60")),
+            request_timeout=float(os.getenv("REQUEST_TIMEOUT", "120")),
             downloads_dir=Path(os.getenv("DOWNLOADS_DIR", "/app/downloads")),
             # Kept out of downloads_dir so Calibre's watched folder holds only e-books.
             config_dir=Path(os.getenv("CONFIG_DIR", "/app/config")),

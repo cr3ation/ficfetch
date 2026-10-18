@@ -127,7 +127,8 @@ Once saved, a **Log in with SSO** button appears on the login page, and the firs
 
 - **Polite by design:** 3–6 s between every AO3 request, with `Retry-After`/backoff on 429s. Large searches are intentionally slow — that's the point.
 - **Public works only** — restricted works are skipped.
-- **Single process:** the rate limiter and job queue live in one process, so never run uvicorn with `--workers N`. The queue is in-memory; a restart mid-job loses it, but files persist and dedup makes re-running cheap.
+- **Single process:** the rate limiter, download queue and running searches live in one process, so never run uvicorn with `--workers N`. They are in-memory; a restart mid-job loses them, but files persist and dedup makes re-running cheap.
+- **Slow AO3, long searches:** a search runs as a background job, so it survives AO3 taking minutes (big fandom listings can take 100 s per page) without tripping a browser or reverse-proxy timeout. Closing the tab, or hitting **Cancel**, stops it.
 - **File ownership:** the container starts as root only to apply `PUID`/`PGID`, then drops to an unprivileged user via `gosu`. To skip that, set `user: "1000:1000"` in compose.
 - **Tailwind via CDN:** the UI needs internet at page load; vendor a built CSS file into `app/static/` for fully offline use.
 
@@ -135,10 +136,11 @@ Once saved, a **Log in with SSO** button appears on the login page, and the firs
 
 Behind the same session cookie as the UI:
 
-- `POST /api/search`, `POST /api/download`
+- `POST /api/search` — starts a search job (`202 {search_id}`); `GET /api/search/{id}` returns its status and result; `POST /api/search/{id}/cancel` stops it
+- `POST /api/download`
 - `GET /api/downloads`, `GET`/`DELETE /api/downloads/{category}/{filename}`
 - `GET /api/cover-preview/{style}` — sample cover JPEG for the Preferences gallery
-- `GET /api/events` — SSE stream (log, progress, item_done, job_done)
+- `GET /api/events` — SSE stream (log, progress, item_done, job_done, search_progress, search_done)
 
 ## Respect creators
 
