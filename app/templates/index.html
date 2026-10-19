@@ -129,14 +129,17 @@
       <section class="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
         <form id="search-form" class="space-y-4">
           <div class="flex flex-col sm:flex-row gap-3">
-            <input id="query" type="text" placeholder="Author, tag, or paste an AO3 work link"
+            <input id="query" type="text" placeholder="Author, tag, keywords, or paste an AO3 work link"
                    class="flex-1 bg-slate-800 border border-slate-700 rounded-lg px-4 py-2.5 text-sm placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500"
                    autocomplete="off" required>
             <div class="flex rounded-lg overflow-hidden border border-slate-700 shrink-0" role="radiogroup" aria-label="Search type">
               <button type="button" data-type="author" class="type-btn px-4 py-2.5 text-sm bg-indigo-600 text-white">Author</button>
               <button type="button" data-type="tag" class="type-btn px-4 py-2.5 text-sm bg-slate-800 text-slate-300">Tag / Fandom</button>
+              <button type="button" data-type="keyword" class="type-btn px-4 py-2.5 text-sm bg-slate-800 text-slate-300">Keywords</button>
             </div>
           </div>
+          <!-- Says what a Tag query will do: commas mean "all of these"; operators belong in Keywords -->
+          <p id="query-hint" class="hidden -mt-2 text-xs text-slate-400"></p>
           <div class="flex flex-wrap items-end gap-4">
             <label class="text-sm">
               <span class="block text-slate-400 mb-1">Format</span>
@@ -190,6 +193,13 @@
               </svg>
               Search guide
             </button>
+            <button type="button" id="open-tag-picker"
+                    class="flex items-center gap-1.5 text-xs text-slate-500 hover:text-slate-300 py-1.5">
+              <svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round">
+                <path d="M3 12V4h8l9 9-8 8-9-9z"/><circle cx="7.5" cy="8.5" r="1.2" fill="currentColor"/>
+              </svg>
+              Find tag
+            </button>
           </div>
 
           <!-- Filters -->
@@ -223,7 +233,7 @@
 
           <!-- Search guide -->
           <div id="guide-panel" class="hidden rounded-lg bg-slate-950/60 border border-slate-800/60 p-4 space-y-4">
-            <div class="grid gap-x-6 gap-y-4 md:grid-cols-3">
+            <div class="grid gap-x-6 gap-y-4 md:grid-cols-2 lg:grid-cols-4">
               <div class="min-w-0">
                 <h3 class="text-slate-200 text-sm font-medium mb-1">Paste a link</h3>
                 <p class="text-xs text-slate-400 leading-relaxed">
@@ -241,17 +251,25 @@
               <div class="min-w-0">
                 <h3 class="text-slate-200 text-sm font-medium mb-1">Tag / Fandom</h3>
                 <p class="text-xs text-slate-400 leading-relaxed">
-                  Canonical AO3 tags — fandoms, relationships or freeform tags. Unknown tags fall back to AO3's general search.
+                  Canonical AO3 tags — fandoms, characters, relationships or freeform tags. Separate several with commas to require <span class="text-slate-300">all</span> of them. Unsure of a name? <span class="text-slate-300">Find tag</span> lists the real ones.
                 </p>
                 <p class="mt-1.5 flex flex-wrap gap-1">
                   <code class="inline-block bg-slate-800 text-indigo-300 rounded px-1.5 py-0.5 text-[11px] leading-5">Harry Potter - J. K. Rowling</code>
                   <code class="inline-block bg-slate-800 text-indigo-300 rounded px-1.5 py-0.5 text-[11px] leading-5">Draco Malfoy/Harry Potter</code>
+                  <code class="inline-block bg-slate-800 text-indigo-300 rounded px-1.5 py-0.5 text-[11px] leading-5">Luke Skywalker, Darth Vader</code>
                   <code class="inline-block bg-slate-800 text-indigo-300 rounded px-1.5 py-0.5 text-[11px] leading-5">Enemies to Lovers</code>
                 </p>
               </div>
+              <div class="min-w-0">
+                <h3 class="text-slate-200 text-sm font-medium mb-1">Keywords</h3>
+                <p class="text-xs text-slate-400 leading-relaxed">
+                  Searches all of AO3 like its search box — titles, summaries, tags and more. Broader than a tag, and supports the operators below.
+                </p>
+                <p class="mt-1.5"><code class="inline-block bg-slate-800 text-indigo-300 rounded px-1.5 py-0.5 text-[11px] leading-5">Sith OR Jedi</code></p>
+              </div>
             </div>
             <div class="border-t border-slate-800/60 pt-3">
-              <h3 class="text-slate-200 text-sm font-medium mb-1.5">Advanced queries</h3>
+              <h3 class="text-slate-200 text-sm font-medium mb-1.5">Keywords operators</h3>
               <div class="flex flex-wrap gap-x-5 gap-y-1.5 text-xs text-slate-400">
                 <span><code class="inline-block bg-slate-800 text-indigo-300 rounded px-1.5 py-0.5 text-[11px] leading-5">"exact phrase"</code> exact words</span>
                 <span><code class="inline-block bg-slate-800 text-indigo-300 rounded px-1.5 py-0.5 text-[11px] leading-5">Harry AND Draco</code> both</span>
@@ -259,7 +277,12 @@
                 <span><code class="inline-block bg-slate-800 text-indigo-300 rounded px-1.5 py-0.5 text-[11px] leading-5">-angst</code> exclude</span>
                 <span><code class="inline-block bg-slate-800 text-indigo-300 rounded px-1.5 py-0.5 text-[11px] leading-5">wolf*</code> wildcard</span>
               </div>
-              <p class="mt-2 text-xs text-slate-500">Filters apply to both Author and Tag searches. Operators work in the general search used as tag fallback.</p>
+              <p class="mt-2 text-xs text-slate-500 leading-relaxed">
+                These work in Keywords searches only. In Tag / Fandom a comma combines tags and every work must have all of them —
+                AO3 can't list works with either of two tags, but Keywords can:
+                <code class="inline-block bg-slate-800 text-indigo-300 rounded px-1.5 py-0.5 text-[11px] leading-5">"Luke Skywalker" OR "Darth Vader"</code>.
+                Filters apply to every search type.
+              </p>
             </div>
           </div>
 
@@ -287,6 +310,8 @@
             Download selected (<span id="selected-count">0</span>)
           </button>
         </div>
+        <!-- Shown when a tag search stops: reopen the tag picker, or search all works instead -->
+        <div id="results-suggestions" class="hidden flex flex-wrap items-center gap-2 px-5 py-3 border-b border-slate-800 text-xs"></div>
         <div class="overflow-x-auto">
           <table class="w-full text-sm">
             <thead>
@@ -337,6 +362,36 @@
       <div id="log" class="h-64 overflow-y-auto px-5 py-3 font-mono text-xs space-y-0.5"></div>
     </section>
   </main>
+
+  <!-- Tag picker: canonical AO3 tags matching a term; pick one or more (works must have all) -->
+  <div id="tag-picker" class="hidden fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-start sm:items-center justify-center p-4 overflow-y-auto"
+       role="dialog" aria-modal="true" aria-labelledby="tp-title">
+    <div class="w-full max-w-2xl max-h-[85vh] flex flex-col bg-slate-900 border border-slate-700 rounded-xl shadow-2xl shadow-black/50">
+      <div class="flex items-center justify-between px-5 pt-4 pb-2">
+        <h2 id="tp-title" class="text-slate-100 font-medium">Pick AO3 tags</h2>
+        <button id="tp-close" type="button" aria-label="Close" class="text-slate-500 hover:text-slate-300 text-xl leading-none px-1">&times;</button>
+      </div>
+      <p id="tp-reason" class="hidden px-5 pb-2 text-sm text-amber-400"></p>
+      <div class="px-5 pb-3 space-y-2 border-b border-slate-800">
+        <form id="tp-form" class="flex gap-2">
+          <input id="tp-filter" type="text" autocomplete="off" placeholder="Filter the list — Enter searches AO3"
+                 class="flex-1 min-w-0 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500">
+          <button id="tp-search" type="submit"
+                  class="shrink-0 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-sm rounded-lg px-3 py-2">Search AO3</button>
+        </form>
+        <div id="tp-types" class="flex flex-wrap gap-1.5 text-xs"></div>
+        <div id="tp-selected" class="hidden flex flex-wrap items-center gap-1.5 text-xs"></div>
+      </div>
+      <p id="tp-status" class="px-5 py-2 text-xs text-slate-400"></p>
+      <ul id="tp-list" class="flex-1 min-h-0 overflow-y-auto px-2 pb-2 text-sm"></ul>
+      <div class="flex flex-wrap items-center gap-2 px-5 py-3 border-t border-slate-800">
+        <button id="tp-keyword" type="button" class="hidden w-full sm:w-auto text-xs text-slate-400 hover:text-slate-200 underline underline-offset-2 text-left"></button>
+        <button id="tp-cancel" type="button" class="ml-auto text-sm text-slate-300 hover:text-slate-100 px-3 py-2">Cancel</button>
+        <button id="tp-apply" type="button" disabled
+                class="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-medium rounded-lg px-4 py-2">Search</button>
+      </div>
+    </div>
+  </div>
 
   <script src="/static/app.js?v={{ app_js_version }}"></script>
 </body>

@@ -50,11 +50,19 @@ class AO3Client:
         )
 
     async def get(
-        self, url: str, *, params: dict | None = None, follow_redirects: bool = True
+        self,
+        url: str,
+        *,
+        params: dict | None = None,
+        follow_redirects: bool = True,
+        retries: int | None = None,
     ) -> httpx.Response:
+        """GET through the global rate limiter. `retries` overrides MAX_RETRIES
+        for one call — 0 for best-effort lookups that must never wait on AO3."""
         s = self._settings
+        max_retries = s.max_retries if retries is None else retries
         async with self._lock:
-            for attempt in range(s.max_retries + 1):
+            for attempt in range(max_retries + 1):
                 gap = random.uniform(s.min_delay, s.max_delay)
                 wait = self._last_request + gap - time.monotonic()
                 if wait > 0:
@@ -64,7 +72,7 @@ class AO3Client:
                     resp = await self._client.get(url, params=params, follow_redirects=follow_redirects)
                 except httpx.HTTPError as exc:
                     self._last_request = time.monotonic()
-                    if attempt >= s.max_retries:
+                    if attempt >= max_retries:
                         raise AO3Error(f"Network error after {attempt + 1} attempts: {exc}") from exc
                     delay = min(10 * (2**attempt), 120)
                     self._bus.log("warning", f"Network error ({exc.__class__.__name__}), retrying in {int(delay)}s...")
@@ -74,6 +82,11 @@ class AO3Client:
                 self._last_request = time.monotonic()
 
                 if resp.status_code == 429:
+                    # Give up on the last attempt rather than sleeping first: the
+                    # wait can be Retry-After long (up to RETRY_AFTER_CAP) and holds
+                    # the lock, stalling all AO3 traffic for nothing.
+                    if attempt >= max_retries:
+                        raise AO3Error(f"AO3 rate limit (429) for {url}, gave up after {attempt + 1} attempts")
                     delay = self._retry_after_seconds(resp)
                     if delay is None:
                         delay = min(s.backoff_base * (2**attempt), s.backoff_cap)
@@ -81,13 +94,13 @@ class AO3Client:
                     self._bus.log(
                         "warning",
                         f"AO3 rate limit (429). Waiting {int(delay)}s before retry "
-                        f"(attempt {attempt + 1}/{s.max_retries})...",
+                        f"(attempt {attempt + 1}/{max_retries})...",
                     )
                     await asyncio.sleep(delay)
                     continue
 
                 if resp.status_code >= 500:
-                    if attempt >= s.max_retries:
+                    if attempt >= max_retries:
                         raise AO3Error(f"AO3 server error {resp.status_code} for {url}")
                     delay = min(10 * (2**attempt), 120)
                     self._bus.log(
@@ -98,10 +111,10 @@ class AO3Client:
                     await asyncio.sleep(delay)
                     continue
 
-                # 2xx/3xx/4xx (incl. 404, which callers need for fallback logic)
+                # 2xx/3xx/4xx (incl. 404, which callers need to report a missing tag or user)
                 return resp
 
-            raise AO3Error(f"Gave up after {s.max_retries} retries: {url}")
+            raise AO3Error(f"Gave up after {max_retries} retries: {url}")
 
     def _retry_after_seconds(self, resp: httpx.Response) -> float | None:
         raw = resp.headers.get("Retry-After")

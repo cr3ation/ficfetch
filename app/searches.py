@@ -1,13 +1,15 @@
-"""Searches as short-lived background jobs.
+"""Searches (and AO3 tag lookups) as short-lived background jobs.
 
 A search can take minutes: pages are 3-6 s apart, a big AO3 tag listing can
 take 100 s to render, and 5xx/429 retries back off for longer still. Holding
 one HTTP request open for all of that loses to any browser or reverse-proxy
 timeout, so POST /api/search only starts a job here; progress streams over
-SSE and the browser fetches the result once `search_done` arrives.
+SSE and the browser fetches the result once `search_done` arrives. Tag
+lookups for the tag picker hit AO3 just as slowly, so they run the same way.
 """
 import asyncio
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 from . import scraper
@@ -15,7 +17,7 @@ from .ao3_client import AO3Client, AO3Error
 from .config import Settings
 from .downloader import downloaded_formats
 from .events import EventBus, current_search_id
-from .models import SearchRequest, SearchResponse
+from .models import SearchRequest, SearchResponse, TagLookup
 
 # Finished jobs stay fetchable this long — enough for an SSE reconnect to
 # recover a missed `search_done`, short enough that results don't pile up.
@@ -31,8 +33,9 @@ class SearchJob:
     search_id: str
     user_id: int
     query: str
+    kind: str = "search"  # search | tags
     status: str = "running"  # running | done | error | cancelled
-    response: SearchResponse | None = None
+    response: SearchResponse | TagLookup | None = None
     error: str | None = None
     finished_at: float | None = None
     task: asyncio.Task | None = field(default=None, repr=False)
@@ -40,6 +43,7 @@ class SearchJob:
     def detail(self) -> dict:
         return {
             "search_id": self.search_id,
+            "kind": self.kind,
             "query": self.query,
             "status": self.status,
             "error": self.error,
@@ -55,16 +59,26 @@ class SearchManager:
         self._jobs: dict[str, SearchJob] = {}
 
     def start(self, user_id: int, req: SearchRequest, max_results: int) -> SearchJob:
+        return self._start(user_id, req.search_id, req.query, "search", lambda: self._search(req, max_results))
+
+    def start_tag_lookup(self, user_id: int, search_id: str, query: str) -> SearchJob:
+        return self._start(
+            user_id, search_id, query, "tags", lambda: scraper.find_tags(self._client, self._settings, self._bus, query)
+        )
+
+    def _start(
+        self, user_id: int, search_id: str, query: str, kind: str, work: Callable[[], Awaitable]
+    ) -> SearchJob:
         self._purge_finished()
-        if req.search_id in self._jobs:
-            raise DuplicateSearchError(req.search_id)
-        job = SearchJob(search_id=req.search_id, user_id=user_id, query=req.query)
+        if search_id in self._jobs:
+            raise DuplicateSearchError(search_id)
+        job = SearchJob(search_id=search_id, user_id=user_id, query=query, kind=kind)
         self._jobs[job.search_id] = job
         # The task copies the current context, so every event it publishes —
-        # scraper and AO3Client logs included — carries this search's id.
+        # scraper and AO3Client logs included — carries this job's id.
         token = current_search_id.set(job.search_id)
         try:
-            job.task = asyncio.create_task(self._run(job, req, max_results))
+            job.task = asyncio.create_task(self._run(job, work))
         finally:
             current_search_id.reset(token)
         return job
@@ -85,40 +99,44 @@ class SearchManager:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _run(self, job: SearchJob, req: SearchRequest, max_results: int) -> None:
-        settings = self._settings
-        query = req.query
-        self._bus.log("info", f"Searching {req.search_type} '{query}' (max {max_results} works)...")
+    async def _run(self, job: SearchJob, work: Callable[[], Awaitable]) -> None:
+        label = "Search" if job.kind == "search" else "Tag lookup"
         try:
-            works, message, truncated = await scraper.search(
-                self._client, settings, self._bus, req, max_results
-            )
-            known = downloaded_formats(settings)
-            downloaded = {w.work_id: known[w.work_id] for w in works if w.work_id in known}
-            job.response = SearchResponse(
-                works=works, message=message, truncated=truncated, downloaded=downloaded
-            )
+            job.response = await work()
             job.status = "done"
-            self._bus.log(
-                "info",
-                f"Search finished: {len(works)} works for '{query}'"
-                + (f" ({len(downloaded)} already in your library)." if downloaded else "."),
-            )
         except asyncio.CancelledError:
             job.status = "cancelled"
-            self._bus.log("warning", f"Search for '{query}' cancelled.")
+            self._bus.log("warning", f"{label} for '{job.query}' cancelled.")
             raise
         except AO3Error as exc:
             job.status = "error"
             job.error = str(exc)
-            self._bus.log("error", f"Search failed: {exc}")
+            self._bus.log("error", f"{label} failed: {exc}")
         except Exception as exc:  # a crash must still end the job, or the browser waits forever
             job.status = "error"
             job.error = f"Unexpected error: {exc}"
-            self._bus.log("error", f"Search crashed: {exc}")
+            self._bus.log("error", f"{label} crashed: {exc}")
         finally:
             job.finished_at = time.monotonic()
             self._bus.publish("search_done", {"status": job.status})
+
+    async def _search(self, req: SearchRequest, max_results: int) -> SearchResponse:
+        settings = self._settings
+        query = req.query
+        self._bus.log("info", f"Searching {req.search_type} '{query}' (max {max_results} works)...")
+        response = await scraper.search(self._client, settings, self._bus, req, max_results)
+        known = downloaded_formats(settings)
+        downloaded = {w.work_id: known[w.work_id] for w in response.works if w.work_id in known}
+        response.downloaded = downloaded
+        if response.tag_unavailable:
+            self._bus.log("warning", f"Search stopped: {response.message}")
+        else:
+            self._bus.log(
+                "info",
+                f"Search finished: {len(response.works)} works for '{query}'"
+                + (f" ({len(downloaded)} already in your library)." if downloaded else "."),
+            )
+        return response
 
     def _purge_finished(self) -> None:
         cutoff = time.monotonic() - RESULT_TTL_SECONDS

@@ -8,7 +8,7 @@ from bs4 import BeautifulSoup
 from .ao3_client import AO3Client, AO3Error, RestrictedWorkError
 from .config import Settings
 from .events import EventBus
-from .models import SearchRequest, Work
+from .models import SearchRequest, SearchResponse, TagHit, TagLookup, Work
 from .utils import encode_tag, parse_work_ref
 
 WORKS_PER_PAGE = 20
@@ -189,11 +189,22 @@ def build_listing_params(req: SearchRequest) -> dict:
         params["work_search[words_to]"] = req.words_to
     if req.exclude_tags:
         params["work_search[excluded_tag_names]"] = ",".join(req.exclude_tags)
+    if req.search_type == "tag":
+        # AO3's "Other tags to include" filter: works must carry every one.
+        extra_tags = split_tags(req.query)[1:]
+        if extra_tags:
+            params["work_search[other_tag_names]"] = ",".join(extra_tags)
     return params
 
 
+def split_tags(query: str) -> list[str]:
+    """Comma-separated tags (AO3 tag names can't contain commas): the first is
+    listed, the rest narrow it down — works must have all of them."""
+    return [t.strip() for t in query.split(",") if t.strip()]
+
+
 def build_generic_search_params(req: SearchRequest) -> dict:
-    """Sort + filter params for the /works/search fallback."""
+    """Sort + filter params for keyword searches (AO3's general /works/search)."""
     query = req.query
     # /works/search has no excluded_tag_names param; folding -"tag" terms into
     # the query matches tag text rather than canonical tag identity — an approximation.
@@ -217,40 +228,105 @@ def build_generic_search_params(req: SearchRequest) -> dict:
     return params
 
 
+def parse_tag_search(html: str) -> tuple[int, list[TagHit]]:
+    """(total matches, tags on this page) from AO3's /tags/search results."""
+    soup = BeautifulSoup(html, "lxml")
+    tags: list[TagHit] = []
+    for span in soup.select("ol.tag.index > li > span"):
+        link = span.select_one("a.tag")
+        if not link:
+            continue
+        # "Character: Anakin Skywalker (53049)" — AO3 puts an &lrm; before the count
+        text = span.get_text(" ", strip=True)
+        uses = re.search(r"\((\d[\d,]*)\)\s*$", text)
+        tags.append(
+            TagHit(
+                name=link.get_text(strip=True),
+                type=text.split(":", 1)[0].strip(),
+                uses=int(uses.group(1).replace(",", "")) if uses else 0,
+            )
+        )
+    total = re.search(r"([\d,]+)\s+Found", soup.get_text(" "))
+    return (int(total.group(1).replace(",", "")) if total else len(tags)), tags
+
+
+async def find_tags(
+    client: AO3Client, settings: Settings, bus: EventBus, term: str, *, retries: int | None = None
+) -> TagLookup:
+    """Canonical AO3 tags matching `term`, most used first — the tag picker's list.
+
+    Canonical tags are exactly the ones with a works list, so anything picked
+    from here can be searched. One results page (AO3 lists 50) is fetched; the
+    picker filters it locally rather than asking AO3 on every keystroke.
+    """
+    bus.log("info", f"Looking up AO3 tags matching '{term}'...")
+    resp = await client.get(
+        f"{settings.base_url}/tags/search",
+        params={
+            "tag_search[name]": term,
+            "tag_search[canonical]": "T",
+            "tag_search[sort_column]": "uses",
+            "tag_search[sort_direction]": "desc",
+        },
+        follow_redirects=False,
+        retries=retries,
+    )
+    if resp.status_code != 200:
+        raise AO3Error(f"Unexpected status {resp.status_code} searching tags for '{term}'")
+    total, tags = parse_tag_search(resp.text)
+    bus.log("info", f"Found {total:,} AO3 tags matching '{term}'" + (f" (showing the {len(tags)} most used)." if total > len(tags) else "."))
+    return TagLookup(query=term, total=total, tags=tags)
+
+
+async def _tag_lookup_or_none(client: AO3Client, settings: Settings, bus: EventBus, term: str) -> TagLookup | None:
+    # Best effort, single attempt: the search has already failed, and a retry
+    # wait would hold AO3's rate-limit lock (and every download). The picker
+    # offers "Try again" when this comes back empty.
+    try:
+        return await find_tags(client, settings, bus, term, retries=0)
+    except AO3Error as exc:
+        bus.log("warning", f"Couldn't look up similar tags on AO3 ({exc}).")
+        return None
+
+
 async def search(
     client: AO3Client,
     settings: Settings,
     bus: EventBus,
     req: SearchRequest,
     max_results: int,
-) -> tuple[list[Work], str | None, bool]:
+) -> SearchResponse:
     """Fetch listing pages until max_results works are collected or pages run out.
 
-    Returns (works, message, truncated) where message carries user-facing notes
-    such as "User not found" or the tag-search fallback notice.
+    A tag search stops rather than guess when AO3 has no works list for the
+    tag; the response then carries tag_unavailable and suggested tags.
     """
-    message: str | None = None
     query = req.query
 
     # A pasted work/chapter URL identifies exactly one work, so it wins over
-    # the Author/Tag toggle and skips listing and pagination entirely.
+    # the search-type toggle and skips listing and pagination entirely.
     work_id = parse_work_ref(query)
     if work_id:
         bus.log("info", f"Recognised a work link — fetching work {work_id} directly.")
         works, message = await fetch_single_work(client, settings, work_id)
-        return works, message, False
+        return SearchResponse(works=works, message=message)
 
-    if req.search_type == "author":
-        base = f"{settings.base_url}/users/{urllib.parse.quote(query)}/works"
+    if req.search_type == "keyword":
+        base = f"{settings.base_url}/works/search"
+        params = build_generic_search_params(req)
     else:
-        base = f"{settings.base_url}/tags/{encode_tag(query)}/works"
-    base = _listing_redirects.get(base, base)
-    params = build_listing_params(req)
+        if req.search_type == "author":
+            base = f"{settings.base_url}/users/{urllib.parse.quote(query)}/works"
+        else:
+            # Several tags: list the first; build_listing_params filters on the rest.
+            tag = split_tags(query)[0]
+            base = f"{settings.base_url}/tags/{encode_tag(tag)}/works"
+        base = _listing_redirects.get(base, base)
+        params = build_listing_params(req)
 
     works: list[Work] = []
     seen_ids: set[str] = set()
     page = 1
-    fallback_attempted = False
     while page <= settings.max_pages and len(works) < max_results:
         request_params = {**params, "page": page, "view_adult": "true"}
         # AO3 redirects non-canonical tags (e.g. "Hermione" -> "Hermione
@@ -264,33 +340,39 @@ async def search(
             resp = await client.get(base, params=request_params, follow_redirects=False)
             if not resp.is_redirect:
                 break
-            base = urllib.parse.urljoin(base, resp.headers["location"]).split("?", 1)[0]
+            target = urllib.parse.urljoin(base, resp.headers["location"]).split("?", 1)[0]
+            if not target.endswith("/works"):
+                # Leads off the works lists: a non-canonical tag with no
+                # canonical synonym only has an info page (AO3: "not a common
+                # tag yet"), which can't be sorted or filtered. Don't fetch it.
+                break
+            base = target
             new_label = urllib.parse.unquote(urllib.parse.urlparse(base).path)
             bus.log("info", f"'{query}' redirected to {new_label} — retrying with your search parameters attached.")
         else:
             raise AO3Error(f"Too many redirects fetching {original_base}")
-        # Only remember renames that land on another listing; a bounce to an
-        # error or front page must not stick for every later search.
-        if base != original_base and base.endswith("/works"):
+        if base != original_base:
             _listing_redirects[original_base] = base
 
-        if resp.status_code == 404:
-            if page > 1:
+        if resp.status_code == 404 or resp.is_redirect:
+            if page > 1 or req.search_type == "keyword":
                 break
             if req.search_type == "author":
-                return [], f"User '{query}' not found on AO3.", False
-            if fallback_attempted:
-                bus.log("warning", f"Generic work search for '{query}' also found no results — giving up.")
-                message = f"Tag '{query}' not found, and the fallback search found no results either."
-                break
-            # Tag page missing: fall back to the generic work search. Filters and
-            # sort survive the switch — params are rebuilt from the same request.
-            fallback_attempted = True
-            bus.log("warning", f"Tag page for '{query}' not found — falling back to generic work search.")
-            message = f"Tag '{query}' not found — showing generic search results instead."
-            base = f"{settings.base_url}/works/search"
-            params = build_generic_search_params(req)
-            continue
+                return SearchResponse(works=[], message=f"User '{query}' not found on AO3.")
+            # A tag search means "the works AO3 files under this tag". When there
+            # is no such list, say so instead of guessing with a general search
+            # (a different, much broader result) — and offer tags that do work.
+            if resp.status_code == 404:
+                message = f"AO3 has no tag called '{tag}'."
+            else:
+                name = urllib.parse.unquote(urllib.parse.urlparse(target).path.rsplit("/", 1)[-1])
+                message = f"'{name}' exists on AO3 but isn't a common tag yet, so AO3 can't list or filter its works."
+            return SearchResponse(
+                works=[],
+                message=message,
+                tag_unavailable=True,
+                tag_lookup=await _tag_lookup_or_none(client, settings, bus, tag),
+            )
 
         if resp.status_code != 200:
             raise AO3Error(f"Unexpected status {resp.status_code} fetching {resp.url}")
@@ -317,7 +399,7 @@ async def search(
         page += 1
 
     truncated = len(works) > max_results or (len(works) == max_results and page <= settings.max_pages)
-    return works[:max_results], message, truncated
+    return SearchResponse(works=works[:max_results], truncated=truncated)
 
 
 def _find_download_href(html: str, ext: str) -> str | None:
