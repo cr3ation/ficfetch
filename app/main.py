@@ -24,7 +24,7 @@ from .downloader import (
     remove_metadata_entry,
 )
 from .events import EventBus
-from .models import EnqueueRequest, SearchRequest
+from .models import EnqueueRequest, SearchRequest, TagSearchRequest
 from .searches import DuplicateSearchError, SearchManager
 from .utils import safe_child
 
@@ -140,6 +140,21 @@ async def api_search(req: SearchRequest, request: Request) -> dict:
     searches: SearchManager = request.app.state.searches
     try:
         job = searches.start(request.state.user.id, req, max_results)
+    except DuplicateSearchError:
+        raise HTTPException(status_code=409, detail="A search with this id already exists.")
+    return {"search_id": job.search_id}
+
+
+@app.post("/api/tag-search", status_code=202)
+async def api_tag_search(req: TagSearchRequest, request: Request) -> dict:
+    """Start a lookup of canonical AO3 tags for the tag picker; the result is
+    fetched like a search's, from GET /api/search/{id} after `search_done`."""
+    query = req.query.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Query must not be empty.")
+    searches: SearchManager = request.app.state.searches
+    try:
+        job = searches.start_tag_lookup(request.state.user.id, req.search_id, query)
     except DuplicateSearchError:
         raise HTTPException(status_code=409, detail="A search with this id already exists.")
     return {"search_id": job.search_id}

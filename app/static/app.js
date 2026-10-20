@@ -23,6 +23,12 @@ const state = {
   searchId: null, // id of this tab's running search job, echoed on its SSE events
   searchMax: 0, // that search's max_results, for the bar's final fraction
   staleSearches: new Set(), // ids this tab abandoned — their late events are dropped
+  // Tag picker: the AO3 lookup it shows (and the one in flight), and the user's picks.
+  picker: {
+    lookupId: null, lookup: null, term: "", error: null, note: null, startedAt: 0,
+    selected: new Set(), type: "all", keywordQuery: null,
+  },
+  lastStop: null, // how the last stopped tag search opened the picker, to reopen it
 };
 
 const $ = (id) => document.getElementById(id);
@@ -78,14 +84,20 @@ es.addEventListener("snapshot", (e) => {
   hideBanner();
   const snap = JSON.parse(e.data);
   if (snap.current) showProgress(snap.current);
-  // A reconnect may have swallowed our search's search_done — ask directly.
+  // A reconnect may have swallowed our jobs' search_done — ask directly.
   if (state.searchId) finishSearch(state.searchId);
+  if (state.picker.lookupId) finishTagLookup(state.picker.lookupId);
 });
 
 es.addEventListener("log", (e) => {
   const d = JSON.parse(e.data);
   if (d.search_id && state.staleSearches.has(d.search_id)) return;
   appendLog(d);
+  // AO3 retry warnings of the picker's lookup show in the picker too — the log is behind it.
+  if (d.search_id && d.search_id === state.picker.lookupId && d.level === "warning") {
+    state.picker.note = d.message;
+    renderPicker();
+  }
 });
 
 es.addEventListener("progress", (e) => showProgress(JSON.parse(e.data)));
@@ -99,6 +111,7 @@ es.addEventListener("search_progress", (e) => {
 es.addEventListener("search_done", (e) => {
   const d = JSON.parse(e.data);
   if (d.search_id === state.searchId) finishSearch(d.search_id);
+  else if (d.search_id === state.picker.lookupId) finishTagLookup(d.search_id);
 });
 
 es.addEventListener("item_done", (e) => {
@@ -163,17 +176,50 @@ $("clear-log").addEventListener("click", () => ($("log").innerHTML = ""));
 // ---------------------------------------------------------------- Search
 
 document.querySelectorAll(".type-btn").forEach((btn) => {
-  btn.addEventListener("click", () => {
-    state.searchType = btn.dataset.type;
-    document.querySelectorAll(".type-btn").forEach((b) => {
-      const active = b === btn;
-      b.classList.toggle("bg-indigo-600", active);
-      b.classList.toggle("text-white", active);
-      b.classList.toggle("bg-slate-800", !active);
-      b.classList.toggle("text-slate-300", !active);
-    });
-  });
+  btn.addEventListener("click", () => setSearchType(btn.dataset.type));
 });
+
+function setSearchType(type) {
+  state.searchType = type;
+  document.querySelectorAll(".type-btn").forEach((b) => {
+    const active = b.dataset.type === type;
+    b.classList.toggle("bg-indigo-600", active);
+    b.classList.toggle("text-white", active);
+    b.classList.toggle("bg-slate-800", !active);
+    b.classList.toggle("text-slate-300", !active);
+  });
+  updateQueryHint();
+}
+
+// Fill in a query and search — used by the tag picker and a stopped tag search.
+function searchFor(query, type) {
+  $("query").value = query;
+  setSearchType(type);
+  startSearch();
+}
+
+// Keywords syntax typed in Tag mode: OR/AND/NOT, quotes, a leading minus, a wildcard.
+const KEYWORD_SYNTAX = /(^|\s)(OR|AND|NOT)(\s|$)|"|(^|\s)-\S|\*/;
+
+// Tag mode reads commas as "all of these" and has no operators; say which,
+// as you type, so a comma isn't mistaken for "or".
+function updateQueryHint() {
+  const hint = $("query-hint");
+  const query = $("query").value.trim();
+  hint.innerHTML = "";
+  if (state.searchType === "tag" && !isWorkLink(query)) {
+    if (KEYWORD_SYNTAX.test(query)) {
+      hint.append("Operators like OR and AND only work in Keywords — in Tag / Fandom, commas separate tags and works must have all of them. ");
+      hint.appendChild(textButton("Switch to Keywords", () => setSearchType("keyword")));
+    } else {
+      const tags = splitTags(query);
+      if (tags.length > 1) hint.textContent = `Works tagged with all of: ${tags.join(" + ")}`;
+    }
+  }
+  hint.classList.toggle("hidden", !hint.textContent);
+}
+
+$("query").addEventListener("input", updateQueryHint);
 
 // ---------------------------------------------------------------- Filters & guide panels
 
@@ -278,7 +324,9 @@ $("search-btn").addEventListener("click", (e) => {
 // A closed tab can't receive the result, so stop its search rather than let it
 // hold AO3's rate limit (and any queued downloads) until it finishes.
 window.addEventListener("pagehide", () => {
-  if (state.searchId) navigator.sendBeacon(`/api/search/${state.searchId}/cancel`);
+  for (const id of [state.searchId, state.picker.lookupId]) {
+    if (id) navigator.sendBeacon(`/api/search/${id}/cancel`);
+  }
 });
 // ...and if the page comes back from the back/forward cache, settle that search.
 window.addEventListener("pageshow", (e) => {
@@ -294,7 +342,7 @@ async function startSearch() {
 
   const maxResults = parseInt($("max-results").value, 10) || 100;
   if (state.searchId) abandonSearch(state.searchId); // a new search supersedes
-  const searchId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  const searchId = newJobId();
   state.searchId = searchId;
   state.searchMax = maxResults;
   setSearching(true);
@@ -353,7 +401,7 @@ async function finishSearch(id, attempt = 0) {
   if (job.status === "done") {
     state.lastQuery = job.query;
     renderResults(job.result);
-    $("search-progress-text").textContent = "Search complete";
+    $("search-progress-text").textContent = job.result.tag_unavailable ? "Tag not available" : "Search complete";
     $("search-progress-fraction").textContent = `${job.result.works.length} / ${state.searchMax}`;
     $("search-progress-bar").style.width = "100%";
   }
@@ -361,10 +409,19 @@ async function finishSearch(id, attempt = 0) {
   endSearch();
 }
 
-// Stop following a search: drop its late events and tell the server to stop it.
-function abandonSearch(id) {
+function newJobId() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
+// Stop following a job (search or tag lookup): drop its late events and tell
+// the server to stop it.
+function dropJob(id) {
   state.staleSearches.add(id);
   fetch(`/api/search/${id}/cancel`, { method: "POST" }).catch(() => {});
+}
+
+function abandonSearch(id) {
+  dropJob(id);
   if (state.searchId === id) endSearch();
 }
 
@@ -406,7 +463,7 @@ $("search-bar-close").addEventListener("click", () => {
 
 // ---------------------------------------------------------------- Results table
 
-function renderResults({ works, message, truncated, downloaded }) {
+function renderResults({ works, message, truncated, downloaded, tag_unavailable, tag_lookup }) {
   state.downloaded = new Map(Object.entries(downloaded || {}));
   // A pasted link would make a useless folder name — file it under the author.
   state.category = isWorkLink(state.lastQuery) && works.length ? works[0].authors[0] : state.lastQuery;
@@ -417,17 +474,319 @@ function renderResults({ works, message, truncated, downloaded }) {
   state.statuses = new Map();
   state.sort = { key: null, dir: "desc" };
 
-  state.resultsLabel =
-    works.length === 0 ? "No works found." : `${works.length} works found${truncated ? " (limit reached)" : ""}`;
+  state.resultsLabel = tag_unavailable
+    ? "" // the message says why there is nothing to list
+    : works.length === 0
+      ? "No works found."
+      : `${works.length} works found${truncated ? " (limit reached)" : ""}`;
   state.resultsFilter = "";
   $("results-filter").value = "";
   $("results-filter-clear").classList.add("hidden");
   $("results-message").textContent = message || "";
+  renderStoppedSearch(tag_unavailable ? { message, lookup: tag_lookup } : null);
   $("results-card").classList.remove("hidden");
   $("select-all").checked = false;
 
   renderResultRows();
 }
+
+// A stopped tag search opens the tag picker on AO3's matching tags, and keeps a
+// way back to it — and to a keyword search for the same text — in the results
+// card. null hides the row.
+function renderStoppedSearch(stop) {
+  const row = $("results-suggestions");
+  row.innerHTML = "";
+  row.classList.toggle("hidden", !stop);
+  state.lastStop = null;
+  if (!stop) return;
+
+  const query = state.lastQuery;
+  const tags = splitTags(query);
+  // Without a lookup (the search's single attempt hit an AO3 hiccup) the picker
+  // asks again itself, as a job with the usual retries.
+  state.lastStop = {
+    term: tags[0],
+    preselected: tags.slice(1), // the other tags of a combined search stay picked
+    lookup: stop.lookup,
+    reason: stop.message,
+    keywordQuery: query,
+  };
+  row.appendChild(chip("Pick a similar tag…", "bg-indigo-600 hover:bg-indigo-500 text-white", () => openTagPicker(state.lastStop)));
+  row.appendChild(
+    chip(`Search all works for “${query}” instead`, "border border-slate-700 hover:bg-slate-800 text-slate-300", () =>
+      searchFor(query, "keyword"),
+    ),
+  );
+  openTagPicker(state.lastStop);
+}
+
+function chip(text, colors, onClick) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = `rounded-md px-2 py-1 ${colors}`;
+  btn.textContent = text;
+  btn.addEventListener("click", onClick);
+  return btn;
+}
+
+// ---------------------------------------------------------------- Tag picker
+
+// Lists canonical AO3 tags matching a term — exactly the tags that have a works
+// list — and runs a Tag search for the picked ones (works must have all). AO3 is
+// asked once per term, as a background job like a search; typing then filters
+// the loaded list locally, since every AO3 request waits its turn in the rate
+// limiter. Tag names come from AO3, so they only ever go in as textContent.
+const TAG_TYPE_COLORS = {
+  Fandom: "text-indigo-300",
+  Character: "text-sky-300",
+  Relationship: "text-rose-300",
+  Freeform: "text-emerald-300",
+};
+
+// Comma-separated tags (AO3 tag names can't contain commas) — the server reads
+// the query the same way: works must have all of them.
+function splitTags(query) {
+  return query
+    .split(",")
+    .map((t) => t.trim())
+    .filter(Boolean);
+}
+
+$("open-tag-picker").addEventListener("click", () => {
+  const query = $("query").value;
+  const tags = state.searchType === "author" || isWorkLink(query) ? [] : splitTags(query);
+  // The last tag is the one to look up; any before it stay picked.
+  const term = tags.pop() || "";
+  openTagPicker({ term, preselected: state.searchType === "tag" ? tags : [] });
+});
+
+function openTagPicker({ term = "", preselected = [], lookup = null, error = null, reason = "", keywordQuery = null } = {}) {
+  Object.assign(state.picker, { term, lookup, error, keywordQuery, selected: new Set(preselected), type: "all" });
+  $("tp-reason").textContent = reason;
+  $("tp-reason").classList.toggle("hidden", !reason);
+  $("tp-filter").value = lookup || error ? "" : term;
+  $("tag-picker").classList.remove("hidden");
+  document.body.classList.add("overflow-hidden");
+  $("tp-filter").focus();
+  if (!lookup && !error && term) lookupTags(term);
+  else renderPicker();
+}
+
+function closeTagPicker() {
+  $("tag-picker").classList.add("hidden");
+  document.body.classList.remove("overflow-hidden");
+  if (state.picker.lookupId) {
+    dropJob(state.picker.lookupId);
+    state.picker.lookupId = null;
+  }
+  $("query").focus();
+}
+
+async function lookupTags(term) {
+  const p = state.picker;
+  if (p.lookupId) dropJob(p.lookupId);
+  const id = newJobId();
+  Object.assign(p, { lookupId: id, term, lookup: null, error: null, note: null, startedAt: Date.now(), type: "all" });
+  renderPicker();
+  try {
+    const resp = await fetch("/api/tag-search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ search_id: id, query: term }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.detail || resp.statusText || `HTTP ${resp.status}`);
+    }
+  } catch (err) {
+    if (p.lookupId !== id) return;
+    Object.assign(p, { lookupId: null, error: `Couldn't start the tag lookup: ${err.message}` });
+    renderPicker();
+  }
+}
+
+async function finishTagLookup(id) {
+  const p = state.picker;
+  let job;
+  try {
+    const resp = await fetch(`/api/search/${id}`);
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.detail || resp.statusText || `HTTP ${resp.status}`);
+    }
+    job = await resp.json();
+  } catch (err) {
+    if (p.lookupId !== id) return;
+    Object.assign(p, { lookupId: null, error: `Couldn't fetch the tag list: ${err.message}` });
+    renderPicker();
+    return;
+  }
+  if (p.lookupId !== id || job.status === "running") return;
+  p.lookupId = null;
+  if (job.status === "done") {
+    p.lookup = job.result;
+    // Reopening the stopped search's picker shouldn't ask AO3 again.
+    if (state.lastStop?.term === job.query) state.lastStop.lookup = job.result;
+  } else if (job.status === "error") {
+    p.error = `AO3 didn't answer the tag lookup (${job.error}).`;
+  }
+  renderPicker();
+}
+
+function renderPicker() {
+  const p = state.picker;
+  const tags = p.lookup?.tags || [];
+  const needle = $("tp-filter").value.trim().toLowerCase();
+  // The text the list was fetched for is no filter on it: AO3 matches words,
+  // not substrings, so filtering by it could hide real matches.
+  const filter = p.lookup && needle === p.lookup.query.toLowerCase() ? "" : needle;
+  const shown = tags.filter(
+    (t) => (p.type === "all" || t.type === p.type) && (!filter || t.name.toLowerCase().includes(filter)),
+  );
+
+  const status = $("tp-status");
+  status.innerHTML = "";
+  if (p.lookupId) {
+    status.textContent = lookupStatus(p);
+  } else if (p.error) {
+    status.textContent = `${p.error} `;
+    if (p.term) status.appendChild(textButton("Try again", () => lookupTags(p.term)));
+  } else if (!p.lookup) {
+    status.textContent = "Type a tag name and press Enter to search AO3.";
+  } else if (!tags.length) {
+    status.textContent = `AO3 has no common tags matching “${p.lookup.query}”.`;
+  } else if (!shown.length) {
+    status.textContent = `None of the loaded tags match “${needle}”. `;
+    if (filter) status.appendChild(textButton(`Search AO3 for “${$("tp-filter").value.trim()}”`, () => lookupTags($("tp-filter").value.trim())));
+  } else {
+    const narrowed = shown.length < tags.length ? `, ${shown.length} after filtering` : "";
+    status.textContent =
+      p.lookup.total > tags.length
+        ? `${p.lookup.total.toLocaleString()} AO3 tags match “${p.lookup.query}” — showing the ${tags.length} most used${narrowed}.`
+        : `${tags.length} AO3 tags match “${p.lookup.query}”${narrowed}.`;
+  }
+
+  const types = $("tp-types");
+  types.innerHTML = "";
+  if (tags.length) {
+    const counts = new Map();
+    for (const t of tags) counts.set(t.type, (counts.get(t.type) || 0) + 1);
+    for (const [type, n] of [["all", tags.length], ...counts]) {
+      const colors = type === p.type ? "bg-indigo-600 text-white" : "bg-slate-800 hover:bg-slate-700 text-slate-300";
+      types.appendChild(
+        chip(`${type === "all" ? "All" : type} ${n}`, colors, () => {
+          p.type = type;
+          renderPicker();
+        }),
+      );
+    }
+  }
+
+  const list = $("tp-list");
+  list.innerHTML = "";
+  for (const t of shown) {
+    const label = document.createElement("label");
+    label.className = "flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-slate-800/60 cursor-pointer";
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.className = "rounded accent-indigo-500 shrink-0";
+    box.checked = p.selected.has(t.name);
+    box.addEventListener("change", () => {
+      if (box.checked) p.selected.add(t.name);
+      else p.selected.delete(t.name);
+      renderPickerSelection();
+    });
+    const name = document.createElement("span");
+    name.className = "flex-1 min-w-0 truncate text-slate-200";
+    name.textContent = name.title = t.name;
+    const type = document.createElement("span");
+    type.className = `shrink-0 text-[11px] ${TAG_TYPE_COLORS[t.type] || "text-slate-400"}`;
+    type.textContent = t.type;
+    const uses = document.createElement("span");
+    uses.className = "shrink-0 w-16 text-right text-xs text-slate-500 tabular-nums";
+    uses.textContent = t.uses.toLocaleString();
+    uses.title = "Uses on AO3 (works and bookmarks)";
+    label.append(box, name, type, uses);
+    const li = document.createElement("li");
+    li.appendChild(label);
+    list.appendChild(li);
+  }
+
+  $("tp-keyword").classList.toggle("hidden", !p.keywordQuery);
+  $("tp-keyword").textContent = p.keywordQuery ? `Search all works for “${p.keywordQuery}” instead` : "";
+  renderPickerSelection();
+}
+
+// AO3 can take minutes to answer (slow pages, retries after errors), so the
+// wait shows its age and AO3's latest answer — otherwise it looks stuck.
+function lookupStatus(p) {
+  const waited = Math.round((Date.now() - p.startedAt) / 1000);
+  return `Asking AO3 for tags matching “${p.term}”… ${waited} s` + (p.note ? ` — last answer: ${p.note}` : " (AO3 can be slow)");
+}
+
+setInterval(() => {
+  if (state.picker.lookupId && !$("tag-picker").classList.contains("hidden")) {
+    $("tp-status").textContent = lookupStatus(state.picker);
+  }
+}, 1000);
+
+function renderPickerSelection() {
+  const p = state.picker;
+  const row = $("tp-selected");
+  row.innerHTML = "";
+  row.classList.toggle("hidden", p.selected.size === 0);
+  if (p.selected.size) {
+    const label = document.createElement("span");
+    label.className = "text-slate-400";
+    label.textContent = p.selected.size > 1 ? "Works with all of:" : "Selected:";
+    row.appendChild(label);
+    for (const name of p.selected) {
+      row.appendChild(
+        chip(`${name} ×`, "bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-200", () => {
+          p.selected.delete(name);
+          renderPicker();
+        }),
+      );
+    }
+  }
+  const n = p.selected.size;
+  $("tp-apply").disabled = n === 0;
+  $("tp-apply").textContent = n > 1 ? `Search ${n} tags` : "Search";
+}
+
+function textButton(text, onClick) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "text-indigo-300 hover:text-indigo-200 underline underline-offset-2";
+  btn.textContent = text;
+  btn.addEventListener("click", onClick);
+  return btn;
+}
+
+$("tp-filter").addEventListener("input", renderPicker);
+$("tp-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const term = $("tp-filter").value.trim();
+  if (term) lookupTags(term);
+});
+$("tp-apply").addEventListener("click", () => {
+  const query = [...state.picker.selected].join(", ");
+  closeTagPicker();
+  searchFor(query, "tag");
+});
+$("tp-keyword").addEventListener("click", () => {
+  const query = state.picker.keywordQuery;
+  closeTagPicker();
+  searchFor(query, "keyword");
+});
+$("tp-cancel").addEventListener("click", closeTagPicker);
+$("tp-close").addEventListener("click", closeTagPicker);
+$("tag-picker").addEventListener("click", (e) => {
+  if (e.target === $("tag-picker")) closeTagPicker(); // backdrop
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !$("tag-picker").classList.contains("hidden")) closeTagPicker();
+});
 
 const RATING_COLORS = {
   "General Audiences": "bg-emerald-900/60 text-emerald-300",

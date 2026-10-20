@@ -23,7 +23,7 @@ Every setting has a default, so it runs straight after a clone even without `.en
 
 ## Using the app
 
-1. **Search** by author (`missyuki1990`), tag/fandom (`Harry Potter`), or paste a work/chapter URL to grab one story. The **Search guide** panel covers the advanced query operators.
+1. **Search** by author (`missyuki1990`), tag/fandom (`Harry Potter`), keywords (`Sith OR Jedi`), or paste a work/chapter URL to grab one story. Separate several tags with commas (`Luke Skywalker, Darth Vader`) for works that have all of them. If AO3 can't list a tag — it doesn't exist, or isn't a common tag yet — the search stops and opens the **tag picker**: AO3's matching canonical tags, most used first, with type and use count, filterable as you type; pick one or more, or search all works for the text instead. **Find tag** opens the same picker at any time. The **Search guide** panel covers the advanced query operators, which work in Keywords searches.
 2. Pick a **format** and **sort** order (kudos, hits, word count…), and optionally open **Filters** (complete-only, word-count range, excluded tags).
 3. Hit **Search** — results stream into the activity log. Rows show stats and rating/WIP badges, and works you already have are marked **In library**. Click the Words/Kudos/Hits headers to re-sort locally.
 4. Tick what you want and **Download selected**. A progress bar and log track each one; duplicates are skipped automatically.
@@ -137,6 +137,7 @@ Once saved, a **Log in with SSO** button appears on the login page, and the firs
 Behind the same session cookie as the UI:
 
 - `POST /api/search` — starts a search job (`202 {search_id}`); `GET /api/search/{id}` returns its status and result; `POST /api/search/{id}/cancel` stops it
+- `POST /api/tag-search` — starts a lookup of canonical AO3 tags for the tag picker; same job id, result and cancel endpoints as a search
 - `POST /api/download`
 - `GET /api/downloads`, `GET`/`DELETE /api/downloads/{category}/{filename}`
 - `GET /api/cover-preview/{style}` — sample cover JPEG for the Preferences gallery

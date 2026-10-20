@@ -7,7 +7,8 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 Format = Literal["epub", "pdf", "mobi", "html", "azw3"]
-SearchType = Literal["author", "tag"]
+# "keyword" is AO3's general work search (its search box): free text with operators.
+SearchType = Literal["author", "tag", "keyword"]
 # Doubles as a whitelist: only these values ever reach AO3 query params.
 SortColumn = Literal["revised_at", "kudos_count", "hits", "bookmarks_count", "word_count"]
 
@@ -29,6 +30,10 @@ class Work(BaseModel):
     complete: bool | None = None  # derived from chapters; None = unknown
 
 
+# Client-chosen job id: shared by searches and tag lookups (see searches.py).
+SEARCH_ID_PATTERN = r"^[a-z0-9]{6,32}$"
+
+
 class SearchRequest(BaseModel):
     query: str
     search_type: SearchType
@@ -40,7 +45,20 @@ class SearchRequest(BaseModel):
     exclude_tags: list[str] = Field(default_factory=list)
     # Client-chosen id: the job's handle, and the tag echoed on its SSE events
     # (see events.current_search_id) — chosen up front so no early event is missed.
-    search_id: str = Field(pattern=r"^[a-z0-9]{6,32}$")
+    search_id: str = Field(pattern=SEARCH_ID_PATTERN)
+
+
+class TagHit(BaseModel):
+    name: str
+    type: str  # AO3 tag type: Fandom, Character, Relationship, Freeform
+    uses: int  # AO3's taggings count (works and bookmarks using the tag)
+
+
+class TagLookup(BaseModel):
+    """Canonical tags matching a term, most used first (AO3's /tags/search)."""
+    query: str
+    total: int  # all matches on AO3; tags holds only the first page of them
+    tags: list[TagHit]
 
 
 class SearchResponse(BaseModel):
@@ -49,6 +67,16 @@ class SearchResponse(BaseModel):
     truncated: bool = False
     # work_id -> formats already in the library, for the results table.
     downloaded: dict[str, list[str]] = Field(default_factory=dict)
+    # A tag search stopped because AO3 has no works list for the tag (unknown,
+    # or not a common tag yet). tag_lookup holds canonical tags matching it, for
+    # the tag picker — None when AO3 didn't answer that lookup.
+    tag_unavailable: bool = False
+    tag_lookup: TagLookup | None = None
+
+
+class TagSearchRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=200)
+    search_id: str = Field(pattern=SEARCH_ID_PATTERN)
 
 
 class EnqueueRequest(BaseModel):
